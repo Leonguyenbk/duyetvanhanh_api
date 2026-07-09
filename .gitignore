@@ -81,6 +81,7 @@ ipython_config.py
 
 # pyenv
 .python-version
+.pdf
 
 # pipenv
 Pipfile.lock
