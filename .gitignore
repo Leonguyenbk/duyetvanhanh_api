@@ -138,3 +138,14 @@ Thumbs.db
 .Spotlight-V100
 .Trashes
 ehthumbs.db
+
+# Dữ liệu làm việc / kết quả xử lý MPLIS — có thể chứa thông tin cá nhân thật
+# (họ tên, số CCCD, ngày sinh, địa chỉ...), KHÔNG được commit lên Git.
+*.xlsx
+*.xlsm
+*.fdf
+*_ThongTinChiTiet.json
+chu_su_dung.json
+/HUONG GCN/
+/ky so/
+/mplis_debug/
