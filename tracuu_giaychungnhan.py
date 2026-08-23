@@ -168,6 +168,33 @@ def lay_to_chuc_tu_gcn_row(row):
     return None
 
 
+def lay_tat_ca_to_chuc_tu_gcn_rows(rows):
+    """Lấy TẤT CẢ object ToChuc (không trùng toChucId) xuất hiện trong toàn bộ rows kết quả
+    AdvancedSearchGiayChungNhan — dùng khi 1 GCN bị trùng dữ liệu chủ sở hữu thành nhiều bản ghi
+    ToChuc khác nhau (khác toChucId, cùng thực thể ngoài đời) cần gộp lại thành 1. Bản ghi đầu
+    tiên trong list trả về được coi là bản ghi CHÍNH; các bản còn lại là bản TRÙNG cần đồng bộ
+    theo bản chính. Trả về [] nếu chủ sở hữu không phải Tổ chức."""
+    ket_qua = []
+    da_thay = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gcn = row.get("GiayChungNhan") or row.get("giayChungNhan") or {}
+        for key in ("ListDangKyQuyen", "ListDangKyTaiSan"):
+            for item in gcn.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                to_chuc = item.get("ToChuc")
+                if not isinstance(to_chuc, dict):
+                    continue
+                to_chuc_id = to_chuc.get("toChucId")
+                if to_chuc_id in da_thay:
+                    continue
+                da_thay.add(to_chuc_id)
+                ket_qua.append(to_chuc)
+    return ket_qua
+
+
 def main():
     if len(sys.argv) < 2:
         print('Cách dùng: python tracuu_giaychungnhan.py "<soPhatHanh>" [tinhId] [xaId] [huyenId]')

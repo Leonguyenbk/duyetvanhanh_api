@@ -32,6 +32,7 @@ import json
 import copy
 import time
 import threading
+import traceback
 import unicodedata
 from datetime import datetime, timezone, timedelta
 from http.cookies import SimpleCookie
@@ -57,6 +58,7 @@ TIMEOUT = 120
 PAGE_LENGTH = 100  # đủ lớn để lấy hết bản ghi khớp 1 tờ/thửa trong 1 lần gọi
 REQUEST_DELAY_SECONDS = 0.15
 THONG_TIN_CHUNK_SIZE = 200  # số tinhHinhDangKyId tối đa gửi trong 1 lần gọi GetThongTinDangKyByTinhHinhDangKyIds
+SAVE_EVERY_ROWS = 30  # tự lưu Excel kết quả sau mỗi 30 bản ghi, tránh mất tiến trình khi file lớn
 
 COL_MA_XA = "Mã xã"
 COL_SO_TO = "Số tờ"
@@ -526,61 +528,175 @@ def dong_trong(stt, ma_xa, so_to, so_thua, ket_qua, chi_tiet):
 
 # ============================ XỬ LÝ CHUNG (dùng cho cả CLI và Tkinter) ============================
 
-def xu_ly_va_xuat_excel(df, ten_goc, input_file, client, log_fn=print, progress_fn=None):
-    """Chạy tra cứu cho từng dòng, gộp theo Mã xã, xuất mỗi xã 1 file Excel.
-    Trả về (list đường dẫn Excel đã xuất, list tinhHinhDangKyId tìm được - không trùng)."""
-    ket_qua_theo_xa = {}
-    tinh_hinh_dang_ky_ids = []
-    da_thay = set()
-    tong = len(df)
-    for idx, (i, row) in enumerate(df.iterrows(), start=1):
-        ma_xa = row[COL_MA_XA]
-        so_to = row[COL_SO_TO]
-        so_thua = row[COL_SO_THUA]
-        stt = i + 1
-        log_fn(f"[{stt}/{tong}] Xã {ma_xa} - Tờ {so_to} - Thửa {so_thua}")
+def trich_dong_tu_chi_tiet(item):
+    """Trích 1 hoặc nhiều dòng kết quả (theo từng thửa đất trong TaiSan.ThuaDats) từ 1 item chi tiết
+    trả về bởi GetThongTinDangKyByTinhHinhDangKyIds — dùng khi tra thẳng theo tinhHinhDangKyId
+    (không đi qua bước AdvancedSearchTinhHinhDangKy nên không có sẵn Số tờ/Số thửa/Mã xã)."""
+    thdk = item.get("TinhHinhDangKy") or {}
+    ma_xa = thdk.get("xaId")
+    thua_dats = [t for t in ((item.get("TaiSan") or {}).get("ThuaDats") or []) if isinstance(t, dict)]
 
-        danh_sach = ket_qua_theo_xa.setdefault(ma_xa, [])
-        try:
-            if not ma_xa or not so_to or not so_thua:
-                raise ValueError("Thiếu Mã xã, Số tờ hoặc Số thửa.")
-            rows = client.tra_cuu_tinh_hinh_dang_ky(ma_xa, so_to, so_thua)
-            if not rows:
-                danh_sach.append(dong_trong(stt, ma_xa, so_to, so_thua, "KHÔNG TÌM THẤY", ""))
-                log_fn("   → Không tìm thấy bản ghi.")
-            else:
-                for item in rows:
-                    dong = trich_dong_ket_qua(stt, ma_xa, so_to, so_thua, item)
-                    danh_sach.append(dong)
-                    thdk_id = dong["tinhHinhDangKyId"]
-                    if thdk_id not in (None, "") and thdk_id not in da_thay:
-                        da_thay.add(thdk_id)
-                        tinh_hinh_dang_ky_ids.append(thdk_id)
-                log_fn(f"   → Tìm thấy {len(rows)} bản ghi.")
-        except Exception as e:
-            danh_sach.append(dong_trong(stt, ma_xa, so_to, so_thua, "LỖI", str(e)))
-            log_fn(f"   → LỖI: {e}")
+    def _dong(so_to, so_thua, ma_xa_dong):
+        return {
+            "STT": "",
+            "Mã xã": ma_xa_dong,
+            "Số tờ": so_to,
+            "Số thửa": so_thua,
+            "tinhHinhDangKyId": thdk.get("tinhHinhDangKyId"),
+            "maDon": thdk.get("maDon"),
+            "soThuTu": thdk.get("soThuTu"),
+            "dieuKienCapGiay": nhan_dieu_kien_cap_giay(thdk.get("dieuKienCapGiay")),
+            "ngayTiepNhan": dotnet_date_to_ddmmyyyy(thdk.get("ngayTiepNhan")),
+            "thoiDiemDangKyLanDau": dotnet_date_to_ddmmyyyy(thdk.get("thoiDiemDangKyLanDau")),
+            "thoiDiemDangKy": dotnet_date_to_ddmmyyyy(thdk.get("thoiDiemDangKy")),
+            "Kết quả": "OK",
+            "Chi tiết": "",
+        }
 
-        if progress_fn:
-            progress_fn(idx, tong)
-        time.sleep(REQUEST_DELAY_SECONDS)
+    if not thua_dats:
+        return [_dong("", "", ma_xa)]
+    return [
+        _dong(t.get("soHieuToBanDo"), t.get("soThuTuThua"), t.get("xaId", ma_xa))
+        for t in thua_dats
+    ]
 
+
+def xu_ly_theo_id(tinh_hinh_dang_ky_ids, ten_goc, output_dir, client, log_fn=print, cap_nhat_ngay=None):
+    """Chế độ tinhHinhDangKyId có sẵn: lấy chi tiết theo từng nhóm ≤200 ID, xuất ngay ra 1 file
+    Excel tổng hợp "<tên gốc>.xlsx" (tự lưu lại sau mỗi nhóm lấy được), đồng thời cập nhật ngay
+    (nếu có cap_nhat_ngay) — trước đây chế độ này chỉ lưu JSON, không có Excel."""
+    danh_sach = []
+    out_path = os.path.join(output_dir, f"{ten_goc}.xlsx")
+
+    def xu_ly_1_nhom(items_chunk):
+        for item in items_chunk:
+            for dong in trich_dong_tu_chi_tiet(item):
+                dong["STT"] = len(danh_sach) + 1
+                danh_sach.append(dong)
+        pd.DataFrame(danh_sach, columns=RESULT_HEADERS).to_excel(out_path, index=False)
+        log_fn(f"Đã lưu tạm kết quả ({len(danh_sach)} dòng): {out_path}")
+        if cap_nhat_ngay:
+            cap_nhat_ngay(items_chunk)
+
+    lay_va_luu_thong_tin_chi_tiet(
+        client, tinh_hinh_dang_ky_ids, output_dir, ten_goc, log_fn=log_fn, on_chunk_fn=xu_ly_1_nhom
+    )
+
+    if danh_sach:
+        pd.DataFrame(danh_sach, columns=RESULT_HEADERS).to_excel(out_path, index=False)
+        log_fn(f"Đã xuất file kết quả: {out_path}")
+    return out_path
+
+
+def tao_ham_cap_nhat_tang_dan(client, dieu_kien_cap_giay, log_fn, xac_nhan_fn):
+    """Trả về (cap_nhat_ngay, lay_tong_ket).
+    cap_nhat_ngay(items_chunk) dùng làm callback: cập nhật NGAY một nhóm bản ghi vừa lấy chi tiết
+    xong (1 xã, hoặc 1 nhóm ID), thay vì đợi lấy chi tiết xong TOÀN BỘ rồi mới cập nhật 1 lần.
+    Chỉ hỏi xác nhận (qua xac_nhan_fn) đúng 1 LẦN DUY NHẤT, trước lần cập nhật đầu tiên."""
+    trang_thai = {"da_hoi": False, "tiep_tuc": True, "thanh_cong": 0, "loi": 0}
+
+    def cap_nhat_ngay(items_chunk):
+        if not dieu_kien_cap_giay or not items_chunk or not trang_thai["tiep_tuc"]:
+            return
+        if not trang_thai["da_hoi"]:
+            trang_thai["da_hoi"] = True
+            if xac_nhan_fn:
+                trang_thai["tiep_tuc"] = xac_nhan_fn(dieu_kien_cap_giay)
+            if not trang_thai["tiep_tuc"]:
+                log_fn("Đã hủy bước cập nhật.")
+                return
+        log_fn(f"Đang cập nhật {len(items_chunk)} bản ghi...")
+        tc, l = cap_nhat_hang_loat(client, items_chunk, dieu_kien_cap_giay, log_fn=log_fn)
+        trang_thai["thanh_cong"] += tc
+        trang_thai["loi"] += l
+
+    def lay_tong_ket():
+        return trang_thai["thanh_cong"], trang_thai["loi"]
+
+    return cap_nhat_ngay, lay_tong_ket
+
+
+def xu_ly_theo_xa(df, ten_goc, input_file, client, log_fn=print, progress_fn=None, cap_nhat_ngay=None):
+    """Tra cứu từng dòng, xử lý THEO TỪNG MÃ XÃ MỘT: tra xong hết các dòng của 1 xã → xuất Excel
+    xã đó → lấy thông tin chi tiết xã đó → gọi cap_nhat_ngay(items) cho xã đó ngay lập tức, rồi
+    mới sang xã tiếp theo (không đợi tra cứu xong TOÀN BỘ file rồi mới cập nhật — quan trọng với
+    file lớn hàng nghìn dòng). Tự lưu lại Excel của xã đang xử lý sau mỗi SAVE_EVERY_ROWS dòng để
+    không mất tiến trình nếu chương trình bị dừng giữa chừng.
+    Trả về list đường dẫn Excel đã xuất."""
     output_dir = os.path.dirname(os.path.abspath(input_file))
+    tong = len(df)
+    da_xu_ly = 0
     duong_dan_ket_qua = []
-    for ma_xa, danh_sach in ket_qua_theo_xa.items():
+
+    for ma_xa, nhom_df in df.groupby(COL_MA_XA, sort=False):
+        danh_sach = []
+        ids_xa = []
+        da_thay = set()
         ten_xa_an_toan = re.sub(r'[\\/*?:"<>|]', "_", str(ma_xa)) or "KhongRoXa"
         out_path = os.path.join(output_dir, f"{ten_xa_an_toan}_{ten_goc}.xlsx")
+
+        for i, row in nhom_df.iterrows():
+            so_to = row[COL_SO_TO]
+            so_thua = row[COL_SO_THUA]
+            stt = i + 1
+            da_xu_ly += 1
+            log_fn(f"[{da_xu_ly}/{tong}] Xã {ma_xa} - Tờ {so_to} - Thửa {so_thua}")
+            try:
+                if not ma_xa or not so_to or not so_thua:
+                    raise ValueError("Thiếu Mã xã, Số tờ hoặc Số thửa.")
+                rows = client.tra_cuu_tinh_hinh_dang_ky(ma_xa, so_to, so_thua)
+                if not rows:
+                    danh_sach.append(dong_trong(stt, ma_xa, so_to, so_thua, "KHÔNG TÌM THẤY", ""))
+                    log_fn("   → Không tìm thấy bản ghi.")
+                else:
+                    for item in rows:
+                        dong = trich_dong_ket_qua(stt, ma_xa, so_to, so_thua, item)
+                        danh_sach.append(dong)
+                        thdk_id = dong["tinhHinhDangKyId"]
+                        if thdk_id not in (None, "") and thdk_id not in da_thay:
+                            da_thay.add(thdk_id)
+                            ids_xa.append(thdk_id)
+                    log_fn(f"   → Tìm thấy {len(rows)} bản ghi.")
+            except Exception as e:
+                danh_sach.append(dong_trong(stt, ma_xa, so_to, so_thua, "LỖI", str(e)))
+                log_fn(f"   → LỖI: {e}")
+
+            if progress_fn:
+                progress_fn(da_xu_ly, tong)
+
+            if da_xu_ly % SAVE_EVERY_ROWS == 0:
+                pd.DataFrame(danh_sach, columns=RESULT_HEADERS).to_excel(out_path, index=False)
+                log_fn(f"   Đã tự lưu tạm sau {da_xu_ly} bản ghi: {out_path}")
+
+            time.sleep(REQUEST_DELAY_SECONDS)
+
         pd.DataFrame(danh_sach, columns=RESULT_HEADERS).to_excel(out_path, index=False)
         log_fn(f"Đã xuất file kết quả cho xã {ma_xa}: {out_path}")
         duong_dan_ket_qua.append(out_path)
-    return duong_dan_ket_qua, tinh_hinh_dang_ky_ids
+
+        if not ids_xa:
+            continue
+
+        try:
+            _out_path, items_xa = lay_va_luu_thong_tin_chi_tiet(
+                client, ids_xa, output_dir, f"{ten_xa_an_toan}_{ten_goc}", log_fn=log_fn
+            )
+        except Exception as e:
+            log_fn(f"Lỗi khi lấy thông tin chi tiết xã {ma_xa}: {e}")
+            continue
+
+        if cap_nhat_ngay:
+            cap_nhat_ngay(items_xa)
+
+    return duong_dan_ket_qua
 
 
-def lay_va_luu_thong_tin_chi_tiet(client, tinh_hinh_dang_ky_ids, output_dir, ten_goc, log_fn=print):
+def lay_va_luu_thong_tin_chi_tiet(client, tinh_hinh_dang_ky_ids, output_dir, ten_goc, log_fn=print, on_chunk_fn=None):
     """Gọi GetThongTinDangKyByTinhHinhDangKyIds cho toàn bộ tinhHinhDangKyId đã tra được,
     lưu nguyên JSON trả về ra file (để tham chiếu/khôi phục sau này nếu cần), đồng thời trả về
     (duong_dan_file, list_item) — list_item dùng ngay cho bước cập nhật trong CÙNG 1 lần chạy,
-    không cần đọc lại file."""
+    không cần đọc lại file. Nếu có on_chunk_fn(items_chunk) thì gọi ngay sau mỗi nhóm (≤200 ID)
+    vừa lấy xong, để bước cập nhật có thể bắt đầu sớm thay vì đợi lấy hết toàn bộ."""
     if not tinh_hinh_dang_ky_ids:
         log_fn("Không có tinhHinhDangKyId nào để lấy thông tin chi tiết.")
         return None, []
@@ -592,11 +708,11 @@ def lay_va_luu_thong_tin_chi_tiet(client, tinh_hinh_dang_ky_ids, output_dir, ten
         ket_qua = client.lay_thong_tin_dang_ky(nhom, get_ho_so_quet=True)
         # Response thực tế có dạng {"value": [...], "success": true} — KHÔNG có key "data".
         du_lieu = ket_qua.get("value") if isinstance(ket_qua, dict) else ket_qua
-        if isinstance(du_lieu, list):
-            tat_ca_ban_ghi.extend(du_lieu)
-        else:
-            tat_ca_ban_ghi.append(ket_qua)
+        chunk_items = du_lieu if isinstance(du_lieu, list) else [ket_qua]
+        tat_ca_ban_ghi.extend(chunk_items)
         log_fn(f"   → Nhóm {idx}/{len(cac_nhom)}: đã lấy thông tin {len(nhom)} bản ghi.")
+        if on_chunk_fn:
+            on_chunk_fn(chunk_items)
 
     out_path = os.path.join(output_dir, f"{ten_goc}_ThongTinChiTiet.json")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -868,6 +984,15 @@ def main():
 
     output_dir = os.path.dirname(os.path.abspath(input_file))
 
+    def xac_nhan_console(dkcg):
+        nhan_dkcg = DIEU_KIEN_CAP_GIAY_MAP.get(int(dkcg)) if dkcg.isdigit() else None
+        print(f"\nSẮP GHI DỮ LIỆU THẬT lên MPLIS.")
+        print(f"dieuKienCapGiay sẽ gán cho các bản ghi tìm được: {dkcg}" + (f" ({nhan_dkcg})" if nhan_dkcg else ""))
+        print("Cập nhật sẽ chạy NGAY theo từng nhóm vừa tra/lấy chi tiết xong, không đợi hết toàn bộ file.")
+        return input("Gõ 'DONG Y' để tiếp tục: ").strip() == "DONG Y"
+
+    cap_nhat_ngay, lay_tong_ket = tao_ham_cap_nhat_tang_dan(client, dieu_kien_cap_giay, print, xac_nhan_console)
+
     if che_do == "id":
         print(f"Phát hiện cột '{cot_id}' → tra thẳng theo tinhHinhDangKyId, bỏ qua bước tra Số tờ/Số thửa.")
         try:
@@ -876,6 +1001,12 @@ def main():
             print(f"Lỗi Excel: {e}")
             sys.exit(1)
         print(f"Đã đọc {len(tinh_hinh_dang_ky_ids)} tinhHinhDangKyId.")
+        try:
+            xu_ly_theo_id(
+                tinh_hinh_dang_ky_ids, ten_goc, output_dir, client, log_fn=print, cap_nhat_ngay=cap_nhat_ngay
+            )
+        except Exception as e:
+            print(f"Lỗi khi lấy thông tin chi tiết: {e}")
     else:
         try:
             df = doc_excel(input_file)
@@ -883,22 +1014,11 @@ def main():
             print(f"Lỗi Excel: {e}")
             sys.exit(1)
         print(f"Đã đọc {len(df)} dòng từ Excel.")
-        _duong_dan, tinh_hinh_dang_ky_ids = xu_ly_va_xuat_excel(df, ten_goc, input_file, client, log_fn=print)
+        xu_ly_theo_xa(df, ten_goc, input_file, client, log_fn=print, cap_nhat_ngay=cap_nhat_ngay)
 
-    items = []
-    try:
-        _out_path, items = lay_va_luu_thong_tin_chi_tiet(client, tinh_hinh_dang_ky_ids, output_dir, ten_goc, log_fn=print)
-    except Exception as e:
-        print(f"Lỗi khi lấy thông tin chi tiết: {e}")
-
-    if dieu_kien_cap_giay and items:
-        nhan_dkcg = DIEU_KIEN_CAP_GIAY_MAP.get(int(dieu_kien_cap_giay)) if dieu_kien_cap_giay.isdigit() else None
-        print(f"\nSẮP GHI DỮ LIỆU THẬT lên MPLIS cho {len(items)} bản ghi.")
-        print(f"dieuKienCapGiay sẽ gán cho TẤT CẢ: {dieu_kien_cap_giay}" + (f" ({nhan_dkcg})" if nhan_dkcg else ""))
-        if input("Gõ 'DONG Y' để tiếp tục cập nhật: ").strip() == "DONG Y":
-            cap_nhat_hang_loat(client, items, dieu_kien_cap_giay, log_fn=print)
-        else:
-            print("Đã hủy bước cập nhật.")
+    if dieu_kien_cap_giay:
+        thanh_cong, loi = lay_tong_ket()
+        print(f"TỔNG CẬP NHẬT: {thanh_cong} thành công, {loi} lỗi.")
     print("HOÀN TẤT.")
 
 
@@ -1136,6 +1256,22 @@ class App:
 
             output_dir = os.path.dirname(os.path.abspath(input_file))
 
+            def xac_nhan_gui(dkcg):
+                lua_chon = self.var_dieu_kien_cap_giay.get().strip()
+                return self.hoi_xac_nhan(
+                    "GHI DỮ LIỆU THẬT lên MPLIS",
+                    "Sẽ cập nhật NGAY theo từng nhóm vừa tra/lấy chi tiết xong "
+                    "(không đợi hết toàn bộ file).\n\n"
+                    "- Hồ sơ quét: ép loaiHoSoQuet=2, laGiayToVeNguonGoc=true (1 file đại diện mỗi hồ sơ quét)\n"
+                    f"- Thông tin đăng ký: dieuKienCapGiay = {lua_chon}\n"
+                    "- Gửi yêu cầu phân loại lại cho các thửa đất trong đơn\n\n"
+                    "Thao tác này GHI TRỰC TIẾP vào dữ liệu MPLIS, không dễ hoàn tác. Tiếp tục?",
+                )
+
+            cap_nhat_ngay, lay_tong_ket = tao_ham_cap_nhat_tang_dan(
+                client, dieu_kien_cap_giay, self.log, xac_nhan_gui
+            )
+
             if che_do == "id":
                 self.log(f"Phát hiện cột '{cot_id}' → tra thẳng theo tinhHinhDangKyId, bỏ qua bước tra Số tờ/Số thửa.")
                 try:
@@ -1145,6 +1281,13 @@ class App:
                     return
                 self.log(f"Đã đọc {len(tinh_hinh_dang_ky_ids)} tinhHinhDangKyId.")
                 self.set_progress(1, 1)
+                try:
+                    xu_ly_theo_id(
+                        tinh_hinh_dang_ky_ids, ten_goc, output_dir, client,
+                        log_fn=self.log, cap_nhat_ngay=cap_nhat_ngay,
+                    )
+                except Exception as e:
+                    self.log(f"Lỗi khi lấy thông tin chi tiết: {e}")
             else:
                 try:
                     df = doc_excel(input_file)
@@ -1153,36 +1296,22 @@ class App:
                     return
                 self.log(f"Đã đọc {len(df)} dòng từ Excel.")
                 self.set_progress(0, len(df))
-                _duong_dan, tinh_hinh_dang_ky_ids = xu_ly_va_xuat_excel(
-                    df, ten_goc, input_file, client, log_fn=self.log, progress_fn=self.set_progress
+                xu_ly_theo_xa(
+                    df, ten_goc, input_file, client,
+                    log_fn=self.log, progress_fn=self.set_progress, cap_nhat_ngay=cap_nhat_ngay,
                 )
 
-            items = []
-            try:
-                _out_path, items = lay_va_luu_thong_tin_chi_tiet(
-                    client, tinh_hinh_dang_ky_ids, output_dir, ten_goc, log_fn=self.log
-                )
-            except Exception as e:
-                self.log(f"Lỗi khi lấy thông tin chi tiết: {e}")
-
-            if dieu_kien_cap_giay and items:
-                lua_chon = self.var_dieu_kien_cap_giay.get().strip()
-                dong_y = self.hoi_xac_nhan(
-                    "GHI DỮ LIỆU THẬT lên MPLIS",
-                    f"Sẽ cập nhật {len(items)} bản ghi vừa lấy được.\n\n"
-                    "- Hồ sơ quét: ép loaiHoSoQuet=2, laGiayToVeNguonGoc=true (1 file đại diện mỗi hồ sơ quét)\n"
-                    f"- Thông tin đăng ký: dieuKienCapGiay = {lua_chon}\n"
-                    "- Gửi yêu cầu phân loại lại cho các thửa đất trong đơn\n\n"
-                    "Thao tác này GHI TRỰC TIẾP vào dữ liệu MPLIS, không dễ hoàn tác. Tiếp tục?",
-                )
-                if dong_y:
-                    self.set_status("Đang cập nhật...")
-                    cap_nhat_hang_loat(client, items, dieu_kien_cap_giay, log_fn=self.log)
-                else:
-                    self.log("Đã hủy bước cập nhật.")
+            if dieu_kien_cap_giay:
+                thanh_cong, loi = lay_tong_ket()
+                self.log(f"TỔNG CẬP NHẬT: {thanh_cong} thành công, {loi} lỗi.")
 
             self.log("HOÀN TẤT.")
             self.set_status("Hoàn tất")
+        except Exception:
+            # Bắt mọi lỗi bất ngờ chưa lường tới, tránh luồng nền chết âm thầm
+            # (trước đây lỗi kiểu này không hiện lên log gì cả, chỉ dừng ngang).
+            self.log("LỖI KHÔNG LƯỜNG TRƯỚC:\n" + traceback.format_exc())
+            self.set_status("Lỗi")
         finally:
             self.running = False
             self.root.after(0, lambda: self.btn_run.config(state="normal"))

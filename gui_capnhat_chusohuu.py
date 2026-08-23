@@ -124,13 +124,22 @@ def clean_cell(v):
     return s
 
 
-def ngay_vn_sang_iso(ddmmyyyy):
-    """Đổi ngày nhập dd/mm/yyyy (hiểu là 00:00 giờ VN) sang chuỗi ISO UTC."""
-    s = (ddmmyyyy or "").strip()
-    m = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$", s)
-    if not m:
-        raise ValueError(f"Ngày không đúng định dạng dd/mm/yyyy: '{ddmmyyyy}'")
-    d, mo, y = map(int, m.groups())
+def ngay_vn_sang_iso(gia_tri):
+    """Đổi ngày nhập dd/mm/yyyy sang chuỗi ISO UTC (hiểu là 00:00 giờ VN).
+    Cũng chấp nhận dạng yyyy-mm-dd (kèm giờ phía sau, vd 'yyyy-mm-dd 00:00:00'), vì nếu cột Excel
+    được định dạng ô kiểu Date thay vì Text thì pandas sẽ đọc ra chuỗi ISO đó thay vì dd/mm/yyyy
+    hiển thị trên Excel - trước đây bị báo sai định dạng oan trong trường hợp này."""
+    s = (gia_tri or "").strip()
+
+    m = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b", s)
+    if m:
+        d, mo, y = map(int, m.groups())
+    else:
+        m = re.match(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})\b", s)
+        if not m:
+            raise ValueError(f"Ngày không đúng định dạng dd/mm/yyyy: '{gia_tri}'")
+        y, mo, d = map(int, m.groups())
+
     dt_vn = datetime(y, mo, d)
     dt_utc = dt_vn - timedelta(hours=7)
     return dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -232,24 +241,30 @@ def ghi_de_giay_to_bo_sung(to_chuc, ngay_cap=None, so_giay_to=None):
 
 
 def xu_ly_1_dong(session, so_phat_hanh, tinh_id, overrides, dai_dien_overrides, ngay_cap, so_giay_to, gui_that):
-    """Tra GCN -> lấy ToChuc -> (nếu có sửa người đại diện) UpdateCaNhan TRƯỚC -> áp overrides
-    Tổ chức -> build + (tuỳ chọn) gửi UpdateToChuc. Trả về dict:
-    {ca_nhan_payload, ca_nhan_result, to_chuc_payload, to_chuc_result} - *_result=None nếu
-    chỉ xem trước (gui_that=False) hoặc bước đó không áp dụng (không sửa người đại diện)."""
+    """Tra GCN -> lấy TẤT CẢ ToChuc tìm thấy (1 GCN có thể bị trùng dữ liệu chủ thành nhiều bản
+    ghi ToChuc khác nhau - khác toChucId, cùng 1 chủ thật) -> bản ĐẦU TIÊN là bản CHÍNH: (nếu có
+    sửa người đại diện) UpdateCaNhan TRƯỚC -> áp overrides + gán maChuSuDung -> build + (tuỳ
+    chọn) gửi UpdateToChuc -> các bản còn lại là bản TRÙNG: đồng bộ TOÀN BỘ thông tin giống hệt
+    bản chính (giữ nguyên các trường định danh riêng, xem TO_CHUC_TRUONG_GIU_NGUYEN) + cùng
+    maChuSuDung, rồi cũng build + (tuỳ chọn) gửi UpdateToChuc cho từng bản trùng.
+    Trả về dict: {ca_nhan_payload, ca_nhan_result, to_chuc_payload, to_chuc_result,
+    to_chuc_trung_payloads, to_chuc_trung_results} - *_result=None/[] nếu chỉ xem trước
+    (gui_that=False) hoặc bước đó không áp dụng (không sửa người đại diện / không có bản trùng)."""
     js_gcn = gcn.tra_cuu_giay_chung_nhan(session, so_phat_hanh, tinh_id)
     rows = js_gcn.get("data") or []
     if not rows:
         raise RuntimeError(f"Không tìm thấy GCN nào khớp Số phát hành: {so_phat_hanh}")
 
-    to_chuc = None
-    for row in rows:
-        to_chuc = gcn.lay_to_chuc_tu_gcn_row(row)
-        if to_chuc:
-            break
-    if not to_chuc:
+    tat_ca_to_chuc = gcn.lay_tat_ca_to_chuc_tu_gcn_rows(rows)
+    if not tat_ca_to_chuc:
         raise RuntimeError("Chủ sở hữu không phải Tổ chức (có thể là Cá nhân/Hộ gia đình).")
+    to_chuc, *to_chuc_trung = tat_ca_to_chuc
 
-    ket_qua = {"ca_nhan_payload": None, "ca_nhan_result": None, "to_chuc_payload": None, "to_chuc_result": None}
+    ket_qua = {
+        "ca_nhan_payload": None, "ca_nhan_result": None,
+        "to_chuc_payload": None, "to_chuc_result": None,
+        "to_chuc_trung_payloads": [], "to_chuc_trung_results": [],
+    }
 
     if dai_dien_overrides:
         ca_nhan = to_chuc.get("NguoiDaiDien")
@@ -261,11 +276,19 @@ def xu_ly_1_dong(session, so_phat_hanh, tinh_id, overrides, dai_dien_overrides, 
             ket_qua["ca_nhan_result"] = cnh.update_ca_nhan(session, ca_nhan_payload)
 
     to_chuc = ghi_de_giay_to_bo_sung(to_chuc, ngay_cap, so_giay_to)
+    overrides = dict(overrides)
+    overrides["maChuSuDung"] = cnh.xac_dinh_ma_chu_su_dung(to_chuc)
     to_chuc_payload = cnh.build_update_to_chuc_payload(to_chuc, **overrides)
     ket_qua["to_chuc_payload"] = to_chuc_payload
 
     if gui_that:
         ket_qua["to_chuc_result"] = cnh.update_to_chuc(session, to_chuc_payload)
+
+    for tc_trung in to_chuc_trung:
+        payload_trung = cnh.build_gop_to_chuc_trung_payload(tc_trung, to_chuc_payload)
+        ket_qua["to_chuc_trung_payloads"].append(payload_trung)
+        if gui_that:
+            ket_qua["to_chuc_trung_results"].append(cnh.update_to_chuc(session, payload_trung))
 
     return ket_qua
 
@@ -597,8 +620,15 @@ class App:
                         ket_qua = "LỖI"
                         loi = f"Server trả success=false ({hau_to})"
 
+                for idx, ket in enumerate(kq.get("to_chuc_trung_results") or [], start=1):
+                    if ket is not None and not ket.get("success", True):
+                        ket_qua = "LỖI"
+                        loi = f"Server trả success=false (bản trùng #{idx})"
+
                 if ket_qua == "OK":
-                    self.log(f"   → {'Đã gửi update' if gui_that else 'Đã kiểm tra, sẵn sàng gửi'}")
+                    so_trung = len(kq.get("to_chuc_trung_payloads") or [])
+                    trung_text = f", gộp {so_trung} bản ToChuc trùng" if so_trung else ""
+                    self.log(f"   → {'Đã gửi update' if gui_that else 'Đã kiểm tra, sẵn sàng gửi'}{trung_text}")
             except Exception as e:
                 ket_qua = "LỖI"
                 loi = str(e)

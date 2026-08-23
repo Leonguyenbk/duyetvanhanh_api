@@ -118,6 +118,43 @@ def _dong_bo_so_giay_to_tuy_than(entity, so_giay_to_moi):
         muc_tieu["soGiayTo"] = so_giay_to_moi
 
 
+# Các trường định danh/hệ thống của riêng 1 bản ghi ToChuc - PHẢI giữ nguyên theo từng bản ghi
+# khi gộp nhiều ToChuc trùng (khác toChucId, cùng 1 chủ thật) thành 1 thông tin duy nhất, để
+# update đúng bản ghi (không lỡ đổi toChucId) và không vỡ khoá lạc quan (version)/liên kết đồ thị
+# (Id/Name/Path/InId/OutId). "xaId" cũng giữ nguyên vì có thể là khoá phân vùng dữ liệu theo xã
+# gắn với chính bản ghi đó trong đồ thị, không chắc an toàn khi đổi theo bản chính.
+TO_CHUC_TRUONG_GIU_NGUYEN = [
+    "toChucId", "Id", "Title", "Description", "Name", "Path", "ParentPath",
+    "Layer", "InId", "OutId", "CreatedDate", "ModifiedDate",
+    "version", "isLastest", "isNew", "isChange", "xaId",
+]
+
+
+def xac_dinh_ma_chu_su_dung(to_chuc_chinh):
+    """Xác định 1 mã chủ sử dụng dùng chung cho tất cả ToChuc trùng của cùng 1 GCN:
+    ưu tiên maChuSuDung có sẵn (không rỗng) trên bản ghi CHÍNH, không có thì dùng chính
+    toChucId của bản ghi chính làm mã (ép về chuỗi để nhất quán kiểu dữ liệu)."""
+    ma = to_chuc_chinh.get("maChuSuDung")
+    if ma not in (None, ""):
+        return ma
+    return str(to_chuc_chinh.get("toChucId"))
+
+
+def build_gop_to_chuc_trung_payload(to_chuc_trung, to_chuc_dich_da_resolve):
+    """Dựng payload cập nhật cho 1 ToChuc TRÙNG (khác toChucId nhưng là cùng 1 chủ thật, do dữ
+    liệu bị nhập lặp) để nó trở thành GIỐNG HỆT to_chuc_dich_da_resolve (bản ghi CHÍNH, đã áp
+    overrides + maChuSuDung) về mọi thông tin nội dung (tên, địa chỉ, mã số, người đại diện,
+    maChuSuDung...), NHƯNG giữ nguyên các trường trong TO_CHUC_TRUONG_GIU_NGUYEN của chính
+    bản ghi trùng đó. to_chuc_trung: dict nguyên bản (chưa sửa) của bản ghi trùng."""
+    payload = copy.deepcopy(to_chuc_dich_da_resolve)
+    for truong in TO_CHUC_TRUONG_GIU_NGUYEN:
+        if truong in to_chuc_trung:
+            payload[truong] = to_chuc_trung[truong]
+        else:
+            payload.pop(truong, None)
+    return payload
+
+
 def build_update_to_chuc_payload(to_chuc, **overrides):
     """to_chuc: dict nguyên bản của ChuSoHuu.ToChucs[0] (từ GetThongTinDangKyByTinhHinhDangKyIds).
     overrides: field muốn sửa ở cấp ToChuc (vd tenToChuc=, diaChi=, maSoDinhDanh=), hoặc field
