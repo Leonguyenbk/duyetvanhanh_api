@@ -2,7 +2,7 @@
 """
 Tool tự động cập nhật trạng thái gói tin đồng bộ thi công (KHÔNG có dữ liệu vận hành)
 - Tkinter UI: nhập username/password đăng nhập lấy token+session, nhập "dotBanGiaoNId"
-- Luồng: lặp lại tra cứu 50 bản ghi có trangThai = 0 → lọc bản ghi có
+- Luồng: lặp lại tra cứu 20 bản ghi có trangThai = 0 → lọc bản ghi có
   ThongTinDangKyVanHanh RỖNG → gửi update (trangThai = 1) từng bản ghi →
   tiếp tục tra cứu lại (start=0) cho đến khi không còn bản ghi trangThai=0
   nào xử lý được nữa (đã hết hoặc chỉ còn bản ghi có dữ liệu vận hành → bỏ qua)
@@ -41,7 +41,7 @@ URL_KIEM_TRA = f"{BASE_URL}/dc/TichHopDongBoDuLieuAjax/KiemTraDuLieuChuyenDoi"
 URL_CAP_NHAT = f"{BASE_URL}/dc/TichHopDongBoDuLieuAjax/UpdateStatusGoiTinDongBoThiCong"
 
 SO_BAN_GHI_MOI_TRANG = 20
-TIMEOUT = 60
+TIMEOUT = 120
 
 
 # ============================ HELPER ============================
@@ -470,7 +470,29 @@ class App:
         self.root.destroy()
 
 
+def kiem_tra_dieu_kien_khoi_dong(root):
+    """Hỏi 2 câu trước khi cho vào app. Trả về True nếu được phép dùng tiếp."""
+    root.withdraw()  # ẩn cửa sổ chính trong lúc hỏi
+
+    beo = messagebox.askyesno("Câu hỏi 1", "Anh Tuấn có béo không?")
+    if beo:
+        messagebox.showerror("Kết thúc", "Bạn đã làm tổn thương anh Tuấn")
+        return False
+
+    dep_trai = messagebox.askyesno("Câu hỏi 2", "Anh Tuấn có đẹp trai không?")
+    if not dep_trai:
+        messagebox.showerror("Kết thúc", "Bạn không trung thực")
+        return False
+
+    messagebox.showinfo("OK", "Cảm ơn bạn đã trung thực")
+    root.deiconify()  # hiện lại cửa sổ chính
+    return True
+
+
 if __name__ == "__main__":
     root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+    if not kiem_tra_dieu_kien_khoi_dong(root):
+        root.destroy()
+    else:
+        app = App(root)
+        root.mainloop()

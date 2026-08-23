@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Tool duyệt vận hành hàng loạt MPLIS
-- Tkinter UI: nhập username/password, chọn folder hồ sơ quét, chọn file Excel
-- Excel cần các cột: "Mã xã", "Số tờ", "Số thửa", "Số phát hành", "Tên file"
-- Các bản ghi trùng "Số phát hành" chỉ xử lý 1 bản ghi đại diện (bản ghi đầu tiên)
+- Tkinter UI: nhập username/password, chọn folder hồ sơ quét, chọn file Excel,
+  checkbox bật/tắt đẩy hồ sơ quét (tắt = chỉ duyệt vận hành)
+- Excel BẮT BUỘC các cột: "Mã xã", "Số phát hành", "Tên mô tả", "Tên file"
+  (tùy chọn: "Số tờ", "Số thửa" — chỉ để hiển thị/log)
+- Tra cứu theo Số phát hành + Mã xã; chỉ duyệt khi tinhHinhDangKyId = 0,
+  khác 0 nghĩa là đã duyệt vận hành → bỏ qua
+- "Tên mô tả" = tenTapTin; nhiều tập tin trong 1 ô cách nhau bởi , hoặc ;
+  ghép cặp với "Tên file" theo thứ tự; đuôi .pdf trong mô tả tự bị cắt;
+  hậu tố cuối mô tả quyết định loaiHoSoQuet: -GT=0, -GCN=1, -DDK=2, -TBXN=3
+- Các bản ghi trùng "Số phát hành" chỉ xử lý 1 bản ghi đại diện (dòng đầu tiên)
 Cài đặt: pip install selenium webdriver-manager requests pandas openpyxl
 """
 
@@ -15,13 +22,14 @@ import copy
 import time
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
 
+import customtkinter as ctk
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -44,15 +52,16 @@ URL_SAVE_DUYET = "https://dla.mplis.gov.vn/dc/ThuThapThongTinAjax/SaveThongTinDa
 TIMEOUT = 180
 KIEM_TRA_TRUOC_KHI_DUYET = True
 
-# Tên cột bắt buộc trong Excel
+# Tên cột trong Excel
 COL_MA_XA = "Mã xã"
-COL_SO_TO = "Số tờ"
-COL_SO_THUA = "Số thửa"
+COL_SO_TO = "Số tờ"           # tùy chọn, chỉ để hiển thị/log
+COL_SO_THUA = "Số thửa"       # tùy chọn, chỉ để hiển thị/log
 COL_SO_PHAT_HANH = "Số phát hành"
 COL_TEN_MO_TA = "Tên mô tả"   # = tenTapTin, nhiều giá trị cách nhau bởi , hoặc ;
 COL_TEN_FILE = "Tên file"     # nhiều file cách nhau bởi , hoặc ; theo đúng thứ tự Tên mô tả
 
-REQUIRED_COLS = [COL_MA_XA, COL_SO_TO, COL_SO_THUA, COL_SO_PHAT_HANH, COL_TEN_MO_TA, COL_TEN_FILE]
+REQUIRED_COLS = [COL_MA_XA, COL_SO_PHAT_HANH, COL_TEN_MO_TA, COL_TEN_FILE]
+OPTIONAL_COLS = [COL_SO_TO, COL_SO_THUA]
 
 
 # ============================ HELPER ============================
@@ -78,9 +87,13 @@ def dotnet_date_to_iso(value):
     if not m:
         return value
     ms = int(m.group(1))
-    if ms <= -62135596800000:
+    # Không dùng datetime.fromtimestamp(): trên Windows nó gọi gmtime() của C runtime,
+    # hàm này không hỗ trợ timestamp âm (ngày trước 1970) → ném OSError [Errno 22].
+    # Cộng timedelta thuần Python thì không đụng tới OS nên xử lý được mọi ngày 0001-9999.
+    try:
+        dt = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=ms)
+    except OverflowError:
         return "0001-01-01T00:00:00.000Z"
-    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(dt.microsecond / 1000):03d}Z"
 
 
@@ -126,6 +139,64 @@ def tach_danh_sach(cell):
     if not s:
         return []
     return [p.strip() for p in re.split(r"[,;]", s) if p.strip()]
+
+
+# Mốc thời gian → loaiGiayChungNhanId (ngày theo giờ Việt Nam)
+BANG_LOAI_GCN = [
+    # (từ ngày,            đến ngày,             ma_loai, tên)
+    (datetime(1993, 10, 15), datetime(2004, 6, 30), 2,  "GCN QSDĐ theo Luật Đất Đai 1993"),
+    (datetime(2004, 7, 1),  datetime(2009, 12, 9),  1,  "GCN QSDĐ theo Luật Đất Đai 2003"),
+    (datetime(2009, 12, 10), datetime(2014, 6, 30), 6,  "GCN theo NĐ 88/2009/NĐ-CP"),
+    (datetime(2014, 7, 1),  datetime(2024, 7, 31),  11, "GCN theo NĐ 43/2014/NĐ-CP"),
+    (datetime(2024, 8, 1),  datetime(9999, 12, 31), 98, "GCN theo Luật Đất đai 2024"),
+]
+
+
+def tinh_loai_gcn_theo_ngay(iso_str):
+    """
+    Nhận chuỗi ISO UTC (vd '2018-12-04T17:00:00.000Z'), đổi sang giờ VN (+7)
+    rồi tra bảng mốc thời gian → trả về loaiGiayChungNhanId, hoặc None nếu không xác định.
+    """
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})", iso_str)
+    if not m:
+        return None
+    y, mo, d, h, mi = map(int, m.groups())
+    if y <= 1:  # ngày 0001-01-01 = không có ngày
+        return None
+    dt_utc = datetime(y, mo, d, h, mi)
+    dt_vn = dt_utc + timedelta(hours=7)  # UTC → giờ Việt Nam
+    ngay = datetime(dt_vn.year, dt_vn.month, dt_vn.day)
+    for tu_ngay, den_ngay, ma_loai, _ten in BANG_LOAI_GCN:
+        if tu_ngay <= ngay <= den_ngay:
+            return ma_loai
+    return None
+
+
+def gan_loai_giay_chung_nhan(obj, log_fn):
+    """
+    Duyệt đệ quy payload: dict nào có key 'loaiGiayChungNhanId' đang trống (None/0)
+    thì tính từ ngayCapGiay (ưu tiên) hoặc ngayVaoSo rồi gán vào.
+    Trả về số chỗ đã gán.
+    """
+    so_gan = 0
+    if isinstance(obj, dict):
+        if "loaiGiayChungNhanId" in obj and not obj.get("loaiGiayChungNhanId"):
+            ngay = obj.get("ngayCapGiay") or obj.get("ngayVaoSo")
+            loai = tinh_loai_gcn_theo_ngay(ngay)
+            if loai is not None:
+                obj["loaiGiayChungNhanId"] = loai
+                so_gan += 1
+                log_fn(f"      • Gán loaiGiayChungNhanId={loai} (theo ngày {str(ngay)[:10]}, soPhatHanh={obj.get('soPhatHanh')})")
+            else:
+                log_fn(f"      • ⚠ Không xác định được loaiGiayChungNhanId (không có ngày cấp/vào sổ, soPhatHanh={obj.get('soPhatHanh')})")
+        for v in obj.values():
+            so_gan += gan_loai_giay_chung_nhan(v, log_fn)
+    elif isinstance(obj, list):
+        for x in obj:
+            so_gan += gan_loai_giay_chung_nhan(x, log_fn)
+    return so_gan
 
 
 def xac_dinh_loai_ho_so_quet(ten_mo_ta):
@@ -228,6 +299,20 @@ class MplisClient:
             self.driver = None
 
     # ---------- request helpers ----------
+    def _post_with_retry(self, url, retries=3, **kwargs):
+        """
+        Gọi session.post với retry khi gặp lỗi socket/kết nối tạm thời
+        (vd. OSError [Errno 22] khi server đóng kết nối keep-alive giữa 2 request liên tiếp).
+        """
+        for attempt in range(1, retries + 1):
+            try:
+                return self.session.post(url, **kwargs)
+            except (requests.exceptions.RequestException, OSError) as e:
+                if attempt >= retries:
+                    raise
+                self.log(f"   ⚠ Lỗi kết nối ({e}), thử lại lần {attempt + 1}/{retries}...")
+                time.sleep(1.5 * attempt)
+
     def _check_response(self, res, name, url):
         if res.status_code == 404:
             raise RuntimeError(f"{name}: URL không tồn tại (404): {url}")
@@ -243,7 +328,7 @@ class MplisClient:
         headers.update({
             "Content-Type": "application/json; charset=UTF-8",
         })
-        res = self.session.post(
+        res = self._post_with_retry(
             url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=headers,
@@ -253,7 +338,8 @@ class MplisClient:
         return res.json()
 
     # ---------- business ----------
-    def tra_cuu_thu_thap_gcn(self, xa_id, so_phat_hanh, so_to, so_thua):
+    def tra_cuu_thu_thap_gcn(self, xa_id, so_phat_hanh, so_to=None, so_thua=None):
+        # Tìm CHỈ theo số phát hành (+ xã), không dùng tờ/thửa
         headers = dict(self.session.headers)
         headers.update({
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -266,8 +352,8 @@ class MplisClient:
             "traCuu[soVaoSo]": "",
             "traCuu[hoTenChu]": "",
             "traCuu[soGiayTo]": "",
-            "traCuu[soThuTuThua]": clean_cell(so_thua),
-            "traCuu[soHieuToBanDo]": clean_cell(so_to),
+            "traCuu[soThuTuThua]": "",
+            "traCuu[soHieuToBanDo]": "",
             "traCuu[soThuTuThuaCu]": "",
             "traCuu[soHieuToBanDoCu]": "",
             "traCuu[type]": "-1",
@@ -278,7 +364,7 @@ class MplisClient:
             "length": "10",
         }
 
-        res = self.session.post(URL_SEARCH_THU_THAP_GCN, data=data, headers=headers, timeout=120)
+        res = self._post_with_retry(URL_SEARCH_THU_THAP_GCN, data=data, headers=headers, timeout=120)
         self._check_response(res, "TRA CỨU", URL_SEARCH_THU_THAP_GCN)
         js = res.json()
 
@@ -288,8 +374,25 @@ class MplisClient:
         rows = js.get("data") or []
         if not rows:
             raise RuntimeError("Không tìm thấy bản ghi thu thập.")
+
         if len(rows) > 1:
-            raise RuntimeError(f"Tìm thấy {len(rows)} bản ghi, dừng để tránh nhầm.")
+            # Lọc lại theo soPhatHanh khớp CHÍNH XÁC (server có thể match gần đúng)
+            sph_can_tim = clean_cell(so_phat_hanh).upper()
+            khop = [
+                r for r in rows
+                if clean_cell(r.get("soPhatHanh")).upper() == sph_can_tim
+            ]
+            if len(khop) == 1:
+                self.log(
+                    f"   → Tra cứu ra {len(rows)} bản ghi, đã lọc còn 1 khớp chính xác soPhatHanh."
+                )
+                rows = khop
+            else:
+                ds_sph = ", ".join(clean_cell(r.get("soPhatHanh")) for r in rows[:5])
+                raise RuntimeError(
+                    f"Tìm thấy {len(rows)} bản ghi ({len(khop)} khớp chính xác soPhatHanh), "
+                    f"dừng để tránh nhầm. Các soPhatHanh: {ds_sph}"
+                )
 
         item = rows[0]
         return {
@@ -343,7 +446,7 @@ class MplisClient:
             )
         ]
 
-        res = self.session.post(
+        res = self._post_with_retry(
             URL_UPLOAD_THU_THAP_GCN, files=files, headers=headers, timeout=TIMEOUT
         )
 
@@ -439,6 +542,12 @@ class MplisClient:
 
         payload_duyet = self.lay_payload_duyet(thu_thap_id)
 
+        # Gán loaiGiayChungNhanId theo mốc thời gian ngày cấp/vào sổ
+        # (cần khi hồ sơ có giấy chứng nhận -GCN; chỉ điền vào chỗ đang trống)
+        so_gan = gan_loai_giay_chung_nhan(payload_duyet, self.log)
+        if so_gan:
+            self.log(f"   → Đã gán loaiGiayChungNhanId cho {so_gan} giấy chứng nhận")
+
         if KIEM_TRA_TRUOC_KHI_DUYET:
             self.check_duyet(payload_duyet)
             self.log("   → Check duyệt OK")
@@ -447,85 +556,87 @@ class MplisClient:
         self.log("   → ✅ Duyệt vận hành thành công")
 
 
-# ============================ TKINTER UI ============================
+# ============================ CUSTOMTKINTER UI ============================
+
+ctk.set_appearance_mode("system")
+ctk.set_default_color_theme("blue")
+
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title("Duyệt vận hành MPLIS hàng loạt")
-        root.geometry("860x640")
+        root.geometry("880x660")
 
         self.client = MplisClient(self.log)
         self.df = None
         self.running = False
         self.stop_flag = False
 
-        frm = ttk.Frame(root, padding=10)
-        frm.pack(fill="x")
+        frm = ctk.CTkFrame(root)
+        frm.pack(fill="x", padx=10, pady=10)
 
         # Username / password
-        ttk.Label(frm, text="Username:").grid(row=0, column=0, sticky="w")
-        self.ent_user = ttk.Entry(frm, width=30)
-        self.ent_user.grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ctk.CTkLabel(frm, text="Username:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.ent_user = ctk.CTkEntry(frm, width=180)
+        self.ent_user.grid(row=0, column=1, sticky="w", padx=5, pady=5)
 
-        ttk.Label(frm, text="Password:").grid(row=0, column=2, sticky="w")
-        self.ent_pass = ttk.Entry(frm, width=30, show="*")
-        self.ent_pass.grid(row=0, column=3, sticky="w", padx=5, pady=3)
+        ctk.CTkLabel(frm, text="Password:").grid(row=0, column=2, sticky="w", padx=5, pady=5)
+        self.ent_pass = ctk.CTkEntry(frm, width=180, show="*")
+        self.ent_pass.grid(row=0, column=3, sticky="w", padx=5, pady=5)
 
         # Folder hồ sơ quét
-        ttk.Label(frm, text="Folder hồ sơ quét:").grid(row=1, column=0, sticky="w")
+        ctk.CTkLabel(frm, text="Folder hồ sơ quét:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.var_folder = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.var_folder, width=60).grid(
-            row=1, column=1, columnspan=2, sticky="we", padx=5, pady=3
+        ctk.CTkEntry(frm, textvariable=self.var_folder, width=440).grid(
+            row=1, column=1, columnspan=2, sticky="we", padx=5, pady=5
         )
-        ttk.Button(frm, text="Chọn folder...", command=self.chon_folder).grid(row=1, column=3, sticky="w")
+        ctk.CTkButton(frm, text="Chọn folder...", command=self.chon_folder).grid(row=1, column=3, sticky="w", padx=5)
 
         # Excel
-        ttk.Label(frm, text="File Excel:").grid(row=2, column=0, sticky="w")
+        ctk.CTkLabel(frm, text="File Excel:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
         self.var_excel = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.var_excel, width=60).grid(
-            row=2, column=1, columnspan=2, sticky="we", padx=5, pady=3
+        ctk.CTkEntry(frm, textvariable=self.var_excel, width=440).grid(
+            row=2, column=1, columnspan=2, sticky="we", padx=5, pady=5
         )
-        ttk.Button(frm, text="Chọn Excel...", command=self.chon_excel).grid(row=2, column=3, sticky="w")
+        ctk.CTkButton(frm, text="Chọn Excel...", command=self.chon_excel).grid(row=2, column=3, sticky="w", padx=5)
 
         # Bật/tắt upload hồ sơ quét
         self.var_upload_hsq = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             frm,
             text="Đẩy hồ sơ quét trước khi duyệt vận hành (tắt = chỉ duyệt vận hành)",
             variable=self.var_upload_hsq,
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(5, 0))
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=(8, 0))
 
         # Buttons
-        btn_frm = ttk.Frame(root, padding=(10, 0))
-        btn_frm.pack(fill="x")
+        btn_frm = ctk.CTkFrame(root)
+        btn_frm.pack(fill="x", padx=10)
 
-        self.btn_login = ttk.Button(btn_frm, text="1. Mở Chrome đăng nhập", command=self.mo_chrome)
-        self.btn_login.pack(side="left", padx=5)
+        self.btn_login = ctk.CTkButton(btn_frm, text="1. Mở Chrome đăng nhập", command=self.mo_chrome)
+        self.btn_login.pack(side="left", padx=5, pady=5)
 
-        self.btn_confirm = ttk.Button(
+        self.btn_confirm = ctk.CTkButton(
             btn_frm, text="2. Đã đăng nhập xong → Lấy session", command=self.lay_session, state="disabled"
         )
-        self.btn_confirm.pack(side="left", padx=5)
+        self.btn_confirm.pack(side="left", padx=5, pady=5)
 
-        self.btn_run = ttk.Button(btn_frm, text="3. Chạy duyệt hàng loạt", command=self.chay, state="disabled")
-        self.btn_run.pack(side="left", padx=5)
+        self.btn_run = ctk.CTkButton(btn_frm, text="3. Chạy duyệt hàng loạt", command=self.chay, state="disabled")
+        self.btn_run.pack(side="left", padx=5, pady=5)
 
-        self.btn_stop = ttk.Button(btn_frm, text="Dừng", command=self.dung, state="disabled")
-        self.btn_stop.pack(side="left", padx=5)
+        self.btn_stop = ctk.CTkButton(btn_frm, text="Dừng", command=self.dung, state="disabled")
+        self.btn_stop.pack(side="left", padx=5, pady=5)
 
         # Progress
-        self.progress = ttk.Progressbar(root, mode="determinate")
-        self.progress.pack(fill="x", padx=10, pady=(8, 0))
-        self.lbl_status = ttk.Label(root, text="Chưa chạy")
+        self.progress = ctk.CTkProgressBar(root)
+        self.progress.set(0)
+        self.progress.pack(fill="x", padx=10, pady=(10, 0))
+        self.lbl_status = ctk.CTkLabel(root, text="Chưa chạy")
         self.lbl_status.pack(anchor="w", padx=10)
 
         # Log box
-        self.txt = tk.Text(root, wrap="word", height=24)
-        self.txt.pack(fill="both", expand=True, padx=10, pady=8)
-        scroll = ttk.Scrollbar(self.txt, command=self.txt.yview)
-        self.txt.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
+        self.txt = ctk.CTkTextbox(root, wrap="word")
+        self.txt.pack(fill="both", expand=True, padx=10, pady=10)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -537,7 +648,7 @@ class App:
         self.root.after(0, _append)
 
     def set_status(self, msg):
-        self.root.after(0, lambda: self.lbl_status.config(text=msg))
+        self.root.after(0, lambda: self.lbl_status.configure(text=msg))
 
     def chon_folder(self):
         d = filedialog.askdirectory(title="Chọn folder chứa hồ sơ quét")
@@ -560,17 +671,17 @@ class App:
             messagebox.showwarning("Thiếu thông tin", "Nhập username và password trước.")
             return
 
-        self.btn_login.config(state="disabled")
+        self.btn_login.configure(state="disabled")
 
         def _work():
             try:
                 self.log("Đang mở Chrome...")
                 self.client.open_browser_and_fill_login(username, password)
                 self.log("Chrome đã mở. Hoàn tất đăng nhập (OTP, captcha... nếu có) rồi bấm nút 2.")
-                self.root.after(0, lambda: self.btn_confirm.config(state="normal"))
+                self.root.after(0, lambda: self.btn_confirm.configure(state="normal"))
             except Exception as e:
                 self.log(f"❌ Lỗi mở Chrome: {e}")
-                self.root.after(0, lambda: self.btn_login.config(state="normal"))
+                self.root.after(0, lambda: self.btn_login.configure(state="normal"))
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -578,7 +689,7 @@ class App:
         def _work():
             try:
                 self.client.build_session_from_browser()
-                self.root.after(0, lambda: self.btn_run.config(state="normal"))
+                self.root.after(0, lambda: self.btn_run.configure(state="normal"))
             except Exception as e:
                 self.log(f"❌ {e}")
 
@@ -596,8 +707,13 @@ class App:
         if missing:
             raise RuntimeError(f"Excel thiếu cột: {', '.join(missing)}. Cần đủ: {', '.join(REQUIRED_COLS)}")
 
+        # Cột tùy chọn: nếu không có thì tự thêm cột rỗng
+        for c in OPTIONAL_COLS:
+            if c not in df.columns:
+                df[c] = ""
+
         # Chuẩn hóa dữ liệu
-        for c in REQUIRED_COLS:
+        for c in REQUIRED_COLS + OPTIONAL_COLS:
             df[c] = df[c].map(clean_cell)
 
         # Bỏ dòng không có Số phát hành
@@ -647,9 +763,9 @@ class App:
 
         self.running = True
         self.stop_flag = False
-        self.btn_run.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        self.progress.config(maximum=len(df), value=0)
+        self.btn_run.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.progress.set(0)
 
         threading.Thread(target=self._run_batch, args=(df, folder, excel, upload_hsq), daemon=True).start()
 
@@ -699,7 +815,7 @@ class App:
                 "Lỗi": loi,
             })
 
-            self.root.after(0, lambda v=i + 1: self.progress.config(value=v))
+            self.root.after(0, lambda v=(i + 1) / total: self.progress.set(v))
 
         # Xuất kết quả
         try:
@@ -719,7 +835,7 @@ class App:
         self.set_status(f"Hoàn tất: {ok} OK | {bo_qua} bỏ qua | {loi} lỗi / {len(results)}")
 
         self.running = False
-        self.root.after(0, lambda: (self.btn_run.config(state="normal"), self.btn_stop.config(state="disabled")))
+        self.root.after(0, lambda: (self.btn_run.configure(state="normal"), self.btn_stop.configure(state="disabled")))
 
     def on_close(self):
         if self.running and not messagebox.askyesno("Đang chạy", "Đang xử lý, thoát luôn?"):
@@ -729,6 +845,6 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = ctk.CTk()
     app = App(root)
     root.mainloop()

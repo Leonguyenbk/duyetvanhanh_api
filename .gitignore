@@ -149,3 +149,8 @@ chu_su_dung.json
 /HUONG GCN/
 /ky so/
 /mplis_debug/
+*.pdf
+/DOWNLOAD/
+response_*.json
+thdk_result.json
+ket_qua_kiem_tra_*.json
