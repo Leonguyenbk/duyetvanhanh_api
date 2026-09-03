@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Tool duyệt vận hành hàng loạt MPLIS
-- Tkinter UI: nhập username/password, chọn folder hồ sơ quét, chọn file Excel
-- Excel cần các cột: "Mã xã", "Số tờ", "Số thửa", "Số phát hành", "Tên file"
-- Các bản ghi trùng "Số phát hành" chỉ xử lý 1 bản ghi đại diện (bản ghi đầu tiên)
+- Tkinter UI: nhập username/password, chọn folder hồ sơ quét, chọn file Excel,
+  checkbox bật/tắt đẩy hồ sơ quét (tắt = chỉ duyệt vận hành)
+- Excel BẮT BUỘC các cột: "Mã xã", "Số phát hành", "Tên mô tả", "Tên file"
+  (tùy chọn: "Số tờ", "Số thửa" — chỉ để hiển thị/log)
+- Tra cứu theo Số phát hành + Mã xã; chỉ duyệt khi tinhHinhDangKyId = 0,
+  khác 0 nghĩa là đã duyệt vận hành → bỏ qua
+- "Tên mô tả" = tenTapTin; nhiều tập tin trong 1 ô cách nhau bởi , hoặc ;
+  ghép cặp với "Tên file" theo thứ tự; đuôi .pdf trong mô tả tự bị cắt;
+  hậu tố cuối mô tả quyết định loaiHoSoQuet: -GT=0, -GCN=1, -DDK=2, -TBXN=3
+- Các bản ghi trùng "Số phát hành" chỉ xử lý 1 bản ghi đại diện (dòng đầu tiên)
 Cài đặt: pip install selenium webdriver-manager requests pandas openpyxl
 """
 
@@ -15,7 +22,7 @@ import copy
 import time
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
@@ -129,19 +136,171 @@ def tach_danh_sach(cell):
     return [p.strip() for p in re.split(r"[,;]", s) if p.strip()]
 
 
+# Mốc thời gian → loaiGiayChungNhanId (ngày theo giờ Việt Nam)
+BANG_LOAI_GCN = [
+    # (từ ngày,            đến ngày,             ma_loai, tên)
+    (datetime(1993, 10, 15), datetime(2004, 6, 30), 2,  "GCN QSDĐ theo Luật Đất Đai 1993"),
+    (datetime(2004, 7, 1),  datetime(2009, 12, 9),  1,  "GCN QSDĐ theo Luật Đất Đai 2003"),
+    (datetime(2009, 12, 10), datetime(2014, 6, 30), 6,  "GCN theo NĐ 88/2009/NĐ-CP"),
+    (datetime(2014, 7, 1),  datetime(2024, 7, 31),  11, "GCN theo NĐ 43/2014/NĐ-CP"),
+    (datetime(2024, 8, 1),  datetime(9999, 12, 31), 98, "GCN theo Luật Đất đai 2024"),
+]
+
+
+def tinh_loai_gcn_theo_ngay(iso_str):
+    """
+    Nhận chuỗi ISO UTC (vd '2018-12-04T17:00:00.000Z'), đổi sang giờ VN (+7)
+    rồi tra bảng mốc thời gian → trả về loaiGiayChungNhanId, hoặc None nếu không xác định.
+    """
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})", iso_str)
+    if not m:
+        return None
+    y, mo, d, h, mi = map(int, m.groups())
+    if y <= 1:  # ngày 0001-01-01 = không có ngày
+        return None
+    dt_utc = datetime(y, mo, d, h, mi)
+    dt_vn = dt_utc + timedelta(hours=7)  # UTC → giờ Việt Nam
+    ngay = datetime(dt_vn.year, dt_vn.month, dt_vn.day)
+    for tu_ngay, den_ngay, ma_loai, _ten in BANG_LOAI_GCN:
+        if tu_ngay <= ngay <= den_ngay:
+            return ma_loai
+    return None
+
+
+def gan_loai_giay_chung_nhan(obj, log_fn):
+    """
+    Duyệt đệ quy payload: dict nào có key 'loaiGiayChungNhanId' đang trống (None/0)
+    thì tính từ ngayCapGiay (ưu tiên) hoặc ngayVaoSo rồi gán vào.
+    Trả về số chỗ đã gán.
+    """
+    so_gan = 0
+    if isinstance(obj, dict):
+        if "loaiGiayChungNhanId" in obj and not obj.get("loaiGiayChungNhanId"):
+            ngay = obj.get("ngayCapGiay") or obj.get("ngayVaoSo")
+            loai = tinh_loai_gcn_theo_ngay(ngay)
+            if loai is not None:
+                obj["loaiGiayChungNhanId"] = loai
+                so_gan += 1
+                log_fn(f"      • Gán loaiGiayChungNhanId={loai} (theo ngày {str(ngay)[:10]}, soPhatHanh={obj.get('soPhatHanh')})")
+            else:
+                log_fn(f"      • ⚠ Không xác định được loaiGiayChungNhanId (không có ngày cấp/vào sổ, soPhatHanh={obj.get('soPhatHanh')})")
+        for v in obj.values():
+            so_gan += gan_loai_giay_chung_nhan(v, log_fn)
+    elif isinstance(obj, list):
+        for x in obj:
+            so_gan += gan_loai_giay_chung_nhan(x, log_fn)
+    return so_gan
+
+
 def xac_dinh_loai_ho_so_quet(ten_mo_ta):
     """
     Xác định loaiHoSoQuet theo HẬU TỐ cuối tên mô tả (sau dấu - hoặc _):
-      -GT = 0 (giấy tờ), -GCN = 1 (giấy chứng nhận),
-      -DDK = 2 (đơn đăng ký), -TBXN = 3 (thông báo xác nhận).
+      -GT = 0 (giấy tờ, cho phép kèm số thứ tự: -GT1, -GT2...),
+      -GCN = 1 (giấy chứng nhận), -DDK = 2 (đơn đăng ký), -TBXN = 3 (thông báo xác nhận).
     Bỏ qua đuôi .pdf nếu có. Không nhận diện được → mặc định 2 (DDK).
     """
     s = (ten_mo_ta or "").strip().upper()
     s = re.sub(r"\.PDF$", "", s)  # bỏ đuôi .pdf nếu có
-    m = re.search(r"[-_](GT|GCN|DDK|TBXN)$", s)
+    m = re.search(r"[-_](GT\d*|GCN|DDK|TBXN)$", s)
     if not m:
         return 2
-    return {"GT": 0, "GCN": 1, "DDK": 2, "TBXN": 3}[m.group(1)]
+    hau_to = m.group(1)
+    if hau_to.startswith("GT"):
+        return 0
+    return {"GCN": 1, "DDK": 2, "TBXN": 3}[hau_to]
+
+
+def ngay_vn_sang_iso(ddmmyyyy):
+    """
+    Đổi ngày nhập dd/mm/yyyy (hiểu là 00:00 giờ VN) sang chuỗi ISO UTC.
+    Ví dụ: 24/04/2026 → '2026-04-23T17:00:00.000Z' (lùi 7 tiếng).
+    """
+    s = (ddmmyyyy or "").strip()
+    m = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$", s)
+    if not m:
+        raise ValueError(f"Ngày không đúng định dạng dd/mm/yyyy: '{ddmmyyyy}'")
+    d, mo, y = map(int, m.groups())
+    dt_vn = datetime(y, mo, d)  # 00:00 giờ VN
+    dt_utc = dt_vn - timedelta(hours=7)
+    return dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+CHU_SU_DUNG_JSON = "chu_su_dung.json"  # nằm cùng thư mục với script
+
+
+def nap_chu_su_dung(chu_su_dung_id, duong_dan_json=None):
+    """
+    Đọc file JSON chứa thông tin chủ, trả về NGUYÊN object ChuSoHuu
+    (gồm CaNhans, ToChucs, HoGiaDinhs...) ứng với toChucId.
+    duong_dan_json trống → mặc định dùng chu_su_dung.json cùng thư mục script.
+    """
+    duong_dan = duong_dan_json or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), CHU_SU_DUNG_JSON
+    )
+    if not os.path.isfile(duong_dan):
+        raise RuntimeError(
+            f"Không thấy file {duong_dan}. "
+            f"Tạo file này: key = toChucId, value = nguyên object ChuSoHuu "
+            f"bắt từ request SaveThongTinDangKy thật trên web."
+        )
+    with open(duong_dan, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    key = str(chu_su_dung_id)
+    if key not in data:
+        raise RuntimeError(
+            f"toChucId {chu_su_dung_id} chưa có trong {os.path.basename(duong_dan)}. "
+            f"Các id hiện có: {', '.join(data.keys()) or '(trống)'}."
+        )
+    tpl = data[key]
+    to_chucs = tpl.get("ToChucs") if isinstance(tpl, dict) else None
+    if not isinstance(to_chucs, list) or not to_chucs or int(to_chucs[0].get("toChucId", -1)) != int(chu_su_dung_id):
+        raise RuntimeError(
+            f"Object của id {chu_su_dung_id} trong {os.path.basename(duong_dan)} không hợp lệ: "
+            f"phải là nguyên ChuSoHuu có ToChucs[0].toChucId = {chu_su_dung_id}."
+        )
+    return tpl
+
+
+def ap_dung_tuy_chinh_payload(payload, thoi_diem_iso, co_quyen_quan_ly, chu_template, log_fn):
+    """
+    Duyệt đệ quy payload duyệt:
+    - dict key 'TinhHinhDangKy' → gán thoiDiemDangKy + coQuyenQuanLy (nếu được cung cấp)
+    - dict key 'ChuSoHuu' → THAY NGUYÊN OBJECT bằng chu_template (nếu được cung cấp),
+      đảm bảo thông tin chủ đúng và đầy đủ theo dữ liệu chuẩn đã lưu.
+    """
+    def _ten_chu(cso):
+        if not isinstance(cso, dict):
+            return "?"
+        cac_ten = []
+        for loai in ("ToChucs", "CaNhans", "HoGiaDinhs", "CongDongs", "NhomNguois", "VoChongs"):
+            for item in (cso.get(loai) or []):
+                if isinstance(item, dict):
+                    cac_ten.append(str(item.get("tenToChuc") or item.get("hoTen") or "?"))
+        return ", ".join(cac_ten) or "(trống)"
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "TinhHinhDangKy" and isinstance(v, dict):
+                    if thoi_diem_iso:
+                        v["thoiDiemDangKy"] = thoi_diem_iso
+                        log_fn(f"      • TinhHinhDangKy.thoiDiemDangKy = {thoi_diem_iso}")
+                    if co_quyen_quan_ly is not None:
+                        v["coQuyenQuanLy"] = bool(co_quyen_quan_ly)
+                        log_fn(f"      • TinhHinhDangKy.coQuyenQuanLy = {bool(co_quyen_quan_ly)}")
+                if k == "ChuSoHuu" and isinstance(v, dict) and chu_template:
+                    cu = _ten_chu(v)
+                    obj[k] = copy.deepcopy(chu_template)
+                    log_fn(f"      • Thay nguyên ChuSoHuu: [{cu}] → [{_ten_chu(chu_template)}]")
+                    continue  # không đi sâu vào object vừa thay
+                _walk(v)
+        elif isinstance(obj, list):
+            for x in obj:
+                _walk(x)
+
+    _walk(payload)
 
 
 # ============================ CORE API ============================
@@ -409,7 +568,8 @@ class MplisClient:
             raise RuntimeError("Duyệt vận hành lỗi: " + str(js)[:800])
         return js
 
-    def xu_ly_1_ban_ghi(self, xa_id, so_to, so_thua, so_phat_hanh, folder_pdf, ds_ten_mo_ta, ds_ten_file, upload_hsq=True):
+    def xu_ly_1_ban_ghi(self, xa_id, so_to, so_thua, so_phat_hanh, folder_pdf, ds_ten_mo_ta, ds_ten_file,
+                        upload_hsq=True, thoi_diem_iso=None, co_quyen_quan_ly=None, chu_template=None):
         danh_sach = []
         if upload_hsq:
             # Ghép cặp Tên mô tả ↔ Tên file theo thứ tự
@@ -457,6 +617,18 @@ class MplisClient:
             self.log("   → Bỏ qua upload hồ sơ quét (đã tắt), chỉ duyệt vận hành")
 
         payload_duyet = self.lay_payload_duyet(thu_thap_id)
+
+        # Gán loaiGiayChungNhanId theo mốc thời gian ngày cấp/vào sổ
+        # (cần khi hồ sơ có giấy chứng nhận -GCN; chỉ điền vào chỗ đang trống)
+        so_gan = gan_loai_giay_chung_nhan(payload_duyet, self.log)
+        if so_gan:
+            self.log(f"   → Đã gán loaiGiayChungNhanId cho {so_gan} giấy chứng nhận")
+
+        # Áp tùy chỉnh từ UI: thời điểm đăng ký, coQuyenQuanLy, thông tin chủ sử dụng (tổ chức)
+        if thoi_diem_iso or co_quyen_quan_ly is not None or chu_template:
+            ap_dung_tuy_chinh_payload(
+                payload_duyet, thoi_diem_iso, co_quyen_quan_ly, chu_template, self.log
+            )
 
         if KIEM_TRA_TRUOC_KHI_DUYET:
             self.check_duyet(payload_duyet)
@@ -515,6 +687,29 @@ class App:
             variable=self.var_upload_hsq,
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(5, 0))
 
+        # Thời điểm đăng ký + coQuyenQuanLy + id chủ sử dụng
+        ttk.Label(frm, text="Thời điểm đăng ký (dd/mm/yyyy):").grid(row=4, column=0, sticky="w")
+        self.ent_thoi_diem = ttk.Entry(frm, width=15)
+        self.ent_thoi_diem.grid(row=4, column=1, sticky="w", padx=5, pady=3)
+
+        self.var_co_quyen_quan_ly = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm, text="coQuyenQuanLy", variable=self.var_co_quyen_quan_ly
+        ).grid(row=4, column=2, sticky="w", padx=5)
+
+        ttk.Label(frm, text="ID chủ sử dụng (toChucId):").grid(row=5, column=0, sticky="w")
+        self.ent_chu_su_dung = ttk.Entry(frm, width=15)
+        self.ent_chu_su_dung.grid(row=5, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(frm, text="(để trống = giữ nguyên payload)").grid(row=5, column=2, columnspan=2, sticky="w")
+
+        # File JSON chứa thông tin chủ
+        ttk.Label(frm, text="File JSON chủ sử dụng:").grid(row=6, column=0, sticky="w")
+        self.var_json_chu = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.var_json_chu, width=60).grid(
+            row=6, column=1, columnspan=2, sticky="we", padx=5, pady=3
+        )
+        ttk.Button(frm, text="Chọn JSON...", command=self.chon_json_chu).grid(row=6, column=3, sticky="w")
+
         # Buttons
         btn_frm = ttk.Frame(root, padding=(10, 0))
         btn_frm.pack(fill="x")
@@ -570,6 +765,14 @@ class App:
         )
         if f:
             self.var_excel.set(f)
+
+    def chon_json_chu(self):
+        f = filedialog.askopenfilename(
+            title="Chọn file JSON chứa thông tin chủ sử dụng",
+            filetypes=[("JSON", "*.json"), ("Tất cả", "*.*")],
+        )
+        if f:
+            self.var_json_chu.set(f)
 
     # ---------- actions ----------
     def mo_chrome(self):
@@ -642,6 +845,28 @@ class App:
         folder = self.var_folder.get().strip()
         excel = self.var_excel.get().strip()
         upload_hsq = self.var_upload_hsq.get()
+        co_quyen_quan_ly = self.var_co_quyen_quan_ly.get()
+
+        # Thời điểm đăng ký (bắt buộc nhập, dd/mm/yyyy)
+        try:
+            thoi_diem_iso = ngay_vn_sang_iso(self.ent_thoi_diem.get())
+        except ValueError as e:
+            messagebox.showwarning("Sai ngày", str(e))
+            return
+
+        # ID chủ sử dụng (tùy chọn): nạp object chuẩn từ file JSON
+        chu_su_dung_id = self.ent_chu_su_dung.get().strip()
+        chu_template = None
+        if chu_su_dung_id:
+            if not chu_su_dung_id.isdigit():
+                messagebox.showwarning("Sai ID", "ID chủ sử dụng (toChucId) phải là số.")
+                return
+            try:
+                json_path = self.var_json_chu.get().strip() or None
+                chu_template = nap_chu_su_dung(int(chu_su_dung_id), json_path)
+            except Exception as e:
+                messagebox.showerror("Lỗi chủ sử dụng", str(e))
+                return
 
         if upload_hsq and (not folder or not os.path.isdir(folder)):
             messagebox.showwarning("Thiếu folder", "Đang bật đẩy hồ sơ quét — chọn folder hồ sơ quét hợp lệ.")
@@ -664,6 +889,9 @@ class App:
         if not messagebox.askyesno(
             "Xác nhận",
             f"Chế độ: {che_do}\n"
+            f"Thời điểm đăng ký: {self.ent_thoi_diem.get().strip()} (→ {thoi_diem_iso})\n"
+            f"coQuyenQuanLy: {co_quyen_quan_ly}\n"
+            f"Chủ sử dụng: {chu_template['ToChucs'][0].get('tenToChuc') + ' (id ' + chu_su_dung_id + ')' if chu_template else '(giữ nguyên)'}\n"
             f"Sẽ xử lý {len(df)} bản ghi (sau khi gộp trùng Số phát hành).\n"
             f"Thao tác DUYỆT VẬN HÀNH không dễ hoàn tác. Tiếp tục?",
         ):
@@ -675,9 +903,13 @@ class App:
         self.btn_stop.config(state="normal")
         self.progress.config(maximum=len(df), value=0)
 
-        threading.Thread(target=self._run_batch, args=(df, folder, excel, upload_hsq), daemon=True).start()
+        threading.Thread(
+            target=self._run_batch,
+            args=(df, folder, excel, upload_hsq, thoi_diem_iso, co_quyen_quan_ly, chu_template),
+            daemon=True,
+        ).start()
 
-    def _run_batch(self, df, folder, excel_path, upload_hsq):
+    def _run_batch(self, df, folder, excel_path, upload_hsq, thoi_diem_iso, co_quyen_quan_ly, chu_template):
         results = []
         total = len(df)
 
@@ -702,6 +934,9 @@ class App:
                     ds_ten_mo_ta=tach_danh_sach(row[COL_TEN_MO_TA]),
                     ds_ten_file=tach_danh_sach(row[COL_TEN_FILE]),
                     upload_hsq=upload_hsq,
+                    thoi_diem_iso=thoi_diem_iso,
+                    co_quyen_quan_ly=co_quyen_quan_ly,
+                    chu_template=chu_template,
                 )
             except BoQuaBanGhi as e:
                 ket_qua = "BỎ QUA"

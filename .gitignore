@@ -152,5 +152,14 @@ chu_su_dung.json
 *.pdf
 /DOWNLOAD/
 response_*.json
+respone_*.json
 thdk_result.json
 ket_qua_kiem_tra_*.json
+
+# Dữ liệu GIS / bản đồ địa chính
+*.gml
+*.xsd
+
+# File test cá nhân / scratch
+kiemtra.py
+
