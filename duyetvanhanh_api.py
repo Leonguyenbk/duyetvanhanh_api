@@ -20,6 +20,7 @@ import json
 import uuid
 import copy
 import time
+import random
 import threading
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -51,6 +52,17 @@ URL_SAVE_DUYET = "https://dla.mplis.gov.vn/dc/ThuThapThongTinAjax/SaveThongTinDa
 
 TIMEOUT = 180
 KIEM_TRA_TRUOC_KHI_DUYET = True
+
+# Cấu hình giãn request mặc định để hạn chế bị MPLIS hỏi Captcha
+DELAY_GIUA_BUOC_MAC_DINH = 0.7    # giây nghỉ giữa các bước API trong cùng 1 hồ sơ (có jitter ±30%)
+DELAY_GIUA_HO_SO_MAC_DINH = 2.5   # giây nghỉ giữa 2 hồ sơ liên tiếp (có jitter ±30%)
+SO_HO_SO_NGHI_DAI = 20            # sau mỗi N hồ sơ duyệt OK liên tiếp sẽ nghỉ giải lao ngắn
+THOI_GIAN_NGHI_DAI = (5.0, 9.0)   # khoảng thời gian nghỉ giải lao (giây)
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # Tên cột trong Excel
 COL_MA_XA = "Mã xã"
@@ -141,6 +153,15 @@ def tach_danh_sach(cell):
     return [p.strip() for p in re.split(r"[,;]", s) if p.strip()]
 
 
+def tinh_delay_jitter(base_seconds, jitter_ratio=0.3):
+    """Trả về thời gian sleep có ngẫu nhiên ±jitter_ratio để tránh nhịp bot cố định."""
+    if base_seconds <= 0:
+        return 0.0
+    low = max(0.05, base_seconds * (1.0 - jitter_ratio))
+    high = base_seconds * (1.0 + jitter_ratio)
+    return random.uniform(low, high)
+
+
 # Mốc thời gian → loaiGiayChungNhanId (ngày theo giờ Việt Nam)
 BANG_LOAI_GCN = [
     # (từ ngày,            đến ngày,             ma_loai, tên)
@@ -221,6 +242,25 @@ class BoQuaBanGhi(Exception):
     pass
 
 
+class LoiCaptchaHoacSession(RuntimeError):
+    """Server yêu cầu Captcha, chặn rate-limit hoặc phiên đăng nhập hết hạn."""
+    pass
+
+
+TU_KHOA_CAPTCHA_SESSION = (
+    "captcha",
+    "recaptcha",
+    "g-recaptcha",
+    "cf-chl",
+    "xác thực",
+    "xac thuc",
+    "too many requests",
+    "rate limit",
+    "phiên làm việc",
+    "đăng nhập lại",
+)
+
+
 class MplisClient:
     def __init__(self, log_fn):
         self.log = log_fn
@@ -290,6 +330,50 @@ class MplisClient:
         self.session = session
         self.log("✅ Đã lấy session + token thành công.")
 
+    def build_session_from_manual_input(self, cookie_str, token):
+        """
+        Dựng session trực tiếp từ Cookie và token dán tay (không cần mở Chrome đăng nhập).
+        Lấy ở F12 > Network > request bất kỳ tới dla.mplis.gov.vn > Request Headers.
+        """
+        cookie_str = (cookie_str or "").strip()
+        token = (token or "").strip()
+        # Cho phép dán nguyên dòng "Cookie: ..." / "__RequestVerificationToken: ..."
+        cookie_str = re.sub(r"^cookie\s*:\s*", "", cookie_str, flags=re.IGNORECASE)
+        token = re.sub(r"^[_a-z]*requestverificationtoken\s*:\s*", "", token, flags=re.IGNORECASE)
+        if not cookie_str:
+            raise ValueError("Cookie không được rỗng.")
+        if not token:
+            raise ValueError("Token không được rỗng.")
+
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://dla.mplis.gov.vn",
+            "Referer": REFERER_URL,
+            "__requestverificationtoken": token,
+            "__RequestVerificationToken": token,
+            "RequestVerificationToken": token,
+        })
+
+        # Tách tay theo ";" thay vì SimpleCookie để không bỏ sót cookie có ký tự lạ
+        so_cookie = 0
+        for part in cookie_str.split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if not name:
+                continue
+            session.cookies.set(name=name, value=value.strip(), domain="dla.mplis.gov.vn", path="/")
+            so_cookie += 1
+        if not so_cookie:
+            raise ValueError("Không đọc được cookie nào từ chuỗi đã dán.")
+
+        self.session = session
+        self.log(f"✅ Đã dựng session từ Cookie/Token dán tay ({so_cookie} cookie).")
+
     def close_browser(self):
         if self.driver:
             try:
@@ -316,12 +400,24 @@ class MplisClient:
     def _check_response(self, res, name, url):
         if res.status_code == 404:
             raise RuntimeError(f"{name}: URL không tồn tại (404): {url}")
+        if res.status_code in (401, 403, 429):
+            raise LoiCaptchaHoacSession(
+                f"{name}: Server chặn hoặc yêu cầu xác thực lại (HTTP {res.status_code}). "
+                f"Nội dung: {res.text[:300]}"
+            )
         ct = res.headers.get("Content-Type") or ""
         if "application/json" not in ct and "text/json" not in ct:
-            raise RuntimeError(
+            raise LoiCaptchaHoacSession(
                 f"{name}: server không trả JSON (status {res.status_code}), "
-                f"có thể mất session hoặc sai URL. Nội dung: {res.text[:400]}"
+                f"có thể dính Captcha hoặc mất session. Nội dung: {res.text[:400]}"
             )
+
+    def _kiem_tra_json_captcha(self, js, name):
+        """Kiểm tra nếu JSON báo lỗi có liên quan tới Captcha hoặc hết phiên."""
+        if isinstance(js, dict) and not js.get("success", True):
+             dump_lower = str(js).lower()
+             if any(kw in dump_lower for kw in TU_KHOA_CAPTCHA_SESSION):
+                 raise LoiCaptchaHoacSession(f"{name} bị yêu cầu Captcha/xác thực: {str(js)[:400]}")
 
     def post_json(self, url, payload, name):
         headers = dict(self.session.headers)
@@ -335,7 +431,9 @@ class MplisClient:
             timeout=TIMEOUT,
         )
         self._check_response(res, name, url)
-        return res.json()
+        js = res.json()
+        self._kiem_tra_json_captcha(js, name)
+        return js
 
     # ---------- business ----------
     def tra_cuu_thu_thap_gcn(self, xa_id, so_phat_hanh, so_to=None, so_thua=None):
@@ -367,6 +465,7 @@ class MplisClient:
         res = self._post_with_retry(URL_SEARCH_THU_THAP_GCN, data=data, headers=headers, timeout=120)
         self._check_response(res, "TRA CỨU", URL_SEARCH_THU_THAP_GCN)
         js = res.json()
+        self._kiem_tra_json_captcha(js, "TRA CỨU")
 
         if not js.get("success"):
             raise RuntimeError("Tra cứu lỗi: " + str(js)[:500])
@@ -452,6 +551,7 @@ class MplisClient:
 
         self._check_response(res, "UPLOAD", URL_UPLOAD_THU_THAP_GCN)
         js = res.json()
+        self._kiem_tra_json_captcha(js, "UPLOAD")
         if not js.get("success"):
             raise RuntimeError("Upload lỗi: " + str(js)[:500])
         return js
@@ -493,7 +593,25 @@ class MplisClient:
             raise RuntimeError("Duyệt vận hành lỗi: " + str(js)[:800])
         return js
 
-    def xu_ly_1_ban_ghi(self, xa_id, so_to, so_thua, so_phat_hanh, folder_pdf, ds_ten_mo_ta, ds_ten_file, upload_hsq=True):
+    def xu_ly_1_ban_ghi(
+        self,
+        xa_id,
+        so_to,
+        so_thua,
+        so_phat_hanh,
+        folder_pdf,
+        ds_ten_mo_ta,
+        ds_ten_file,
+        upload_hsq=True,
+        delay_buoc=DELAY_GIUA_BUOC_MAC_DINH,
+        sleep_fn=None,
+    ):
+        _sleep = sleep_fn or time.sleep
+
+        def _nghi_giua_buoc():
+            if delay_buoc and delay_buoc > 0:
+                _sleep(tinh_delay_jitter(delay_buoc))
+
         danh_sach = []
         if upload_hsq:
             # Ghép cặp Tên mô tả ↔ Tên file theo thứ tự
@@ -534,9 +652,12 @@ class MplisClient:
                 f"Đã duyệt vào vận hành (tinhHinhDangKyId={thdk_id})"
             )
 
+        _nghi_giua_buoc()
+
         if upload_hsq:
             self.upload_files(thu_thap_id, danh_sach)
             self.log(f"   → Upload {len(danh_sach)} hồ sơ quét OK")
+            _nghi_giua_buoc()
         else:
             self.log("   → Bỏ qua upload hồ sơ quét (đã tắt), chỉ duyệt vận hành")
 
@@ -548,9 +669,12 @@ class MplisClient:
         if so_gan:
             self.log(f"   → Đã gán loaiGiayChungNhanId cho {so_gan} giấy chứng nhận")
 
+        _nghi_giua_buoc()
+
         if KIEM_TRA_TRUOC_KHI_DUYET:
             self.check_duyet(payload_duyet)
             self.log("   → Check duyệt OK")
+            _nghi_giua_buoc()
 
         self.save_duyet(payload_duyet)
         self.log("   → ✅ Duyệt vận hành thành công")
@@ -566,12 +690,14 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Duyệt vận hành MPLIS hàng loạt")
-        root.geometry("880x660")
+        root.geometry("920x720")
 
         self.client = MplisClient(self.log)
         self.df = None
         self.running = False
         self.stop_flag = False
+        self.resume_event = threading.Event()
+        self.resume_event.set()
 
         frm = ctk.CTkFrame(root)
         frm.pack(fill="x", padx=10, pady=10)
@@ -609,6 +735,44 @@ class App:
             variable=self.var_upload_hsq,
         ).grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=(8, 0))
 
+        # Cookie / Token dán tay (thay cho bước 1-2 đăng nhập qua Chrome)
+        ctk.CTkLabel(frm, text="Cookie:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        self.ent_cookie = ctk.CTkEntry(
+            frm, width=440, placeholder_text="dán Cookie từ F12 › Network › Request Headers"
+        )
+        self.ent_cookie.grid(row=4, column=1, columnspan=2, sticky="we", padx=5, pady=5)
+
+        ctk.CTkLabel(frm, text="Token:").grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        self.ent_token = ctk.CTkEntry(
+            frm, width=440, placeholder_text="__RequestVerificationToken"
+        )
+        self.ent_token.grid(row=5, column=1, columnspan=2, sticky="we", padx=5, pady=5)
+
+        ctk.CTkButton(
+            frm, text="Dùng Cookie/Token", command=self.dung_cookie_token
+        ).grid(row=4, column=3, rowspan=2, sticky="w", padx=5)
+
+        # Cấu hình giãn nhịp request chống Captcha
+        delay_frm = ctk.CTkFrame(frm, fg_color="transparent")
+        delay_frm.grid(row=6, column=0, columnspan=4, sticky="we", padx=5, pady=(6, 4))
+
+        ctk.CTkLabel(delay_frm, text="Nghỉ giữa bước (s):").pack(side="left", padx=(0, 4))
+        self.ent_delay_buoc = ctk.CTkEntry(delay_frm, width=65)
+        self.ent_delay_buoc.insert(0, str(DELAY_GIUA_BUOC_MAC_DINH))
+        self.ent_delay_buoc.pack(side="left", padx=(0, 14))
+
+        ctk.CTkLabel(delay_frm, text="Nghỉ giữa hồ sơ (s):").pack(side="left", padx=(0, 4))
+        self.ent_delay_hoso = ctk.CTkEntry(delay_frm, width=65)
+        self.ent_delay_hoso.insert(0, str(DELAY_GIUA_HO_SO_MAC_DINH))
+        self.ent_delay_hoso.pack(side="left", padx=(0, 14))
+
+        self.var_pause_captcha = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            delay_frm,
+            text="Tự tạm dừng khi dính Captcha/mất session (lấy lại session rồi Tiếp tục)",
+            variable=self.var_pause_captcha,
+        ).pack(side="left", padx=4)
+
         # Buttons
         btn_frm = ctk.CTkFrame(root)
         btn_frm.pack(fill="x", padx=10)
@@ -623,6 +787,16 @@ class App:
 
         self.btn_run = ctk.CTkButton(btn_frm, text="3. Chạy duyệt hàng loạt", command=self.chay, state="disabled")
         self.btn_run.pack(side="left", padx=5, pady=5)
+
+        self.btn_resume = ctk.CTkButton(
+            btn_frm,
+            text="▶ Tiếp tục (sau Captcha)",
+            command=self.tiep_tuc,
+            state="disabled",
+            fg_color="#2a9d8f",
+            hover_color="#21867a",
+        )
+        self.btn_resume.pack(side="left", padx=5, pady=5)
 
         self.btn_stop = ctk.CTkButton(btn_frm, text="Dừng", command=self.dung, state="disabled")
         self.btn_stop.pack(side="left", padx=5, pady=5)
@@ -649,6 +823,14 @@ class App:
 
     def set_status(self, msg):
         self.root.after(0, lambda: self.lbl_status.configure(text=msg))
+
+    def _sleep_co_kiem_tra_dung(self, seconds):
+        """Sleep chia nhỏ để khi bấm Dừng thì thoát ngay."""
+        end_time = time.time() + max(0.0, seconds)
+        while time.time() < end_time:
+            if self.stop_flag:
+                return
+            time.sleep(min(0.1, end_time - time.time()))
 
     def chon_folder(self):
         d = filedialog.askdirectory(title="Chọn folder chứa hồ sơ quét")
@@ -689,14 +871,33 @@ class App:
         def _work():
             try:
                 self.client.build_session_from_browser()
-                self.root.after(0, lambda: self.btn_run.configure(state="normal"))
+                if not self.running:
+                    self.root.after(0, lambda: self.btn_run.configure(state="normal"))
             except Exception as e:
                 self.log(f"❌ {e}")
 
         threading.Thread(target=_work, daemon=True).start()
 
+    def dung_cookie_token(self):
+        try:
+            self.client.build_session_from_manual_input(
+                self.ent_cookie.get(), self.ent_token.get()
+            )
+        except Exception as e:
+            messagebox.showwarning("Cookie/Token", str(e))
+            return
+        if not self.running:
+            self.btn_run.configure(state="normal")
+
+    def tiep_tuc(self):
+        self.btn_resume.configure(state="disabled")
+        self.log("▶ Đã bấm Tiếp tục — thử lại bản ghi đang tạm dừng...")
+        self.resume_event.set()
+
     def dung(self):
         self.stop_flag = True
+        self.resume_event.set()
+        self.btn_resume.configure(state="disabled")
         self.log("⏸ Đã yêu cầu dừng, sẽ dừng sau bản ghi hiện tại...")
 
     def doc_excel(self, path):
@@ -735,6 +936,15 @@ class App:
         excel = self.var_excel.get().strip()
         upload_hsq = self.var_upload_hsq.get()
 
+        try:
+            delay_buoc = float(self.ent_delay_buoc.get().strip() or DELAY_GIUA_BUOC_MAC_DINH)
+            delay_hoso = float(self.ent_delay_hoso.get().strip() or DELAY_GIUA_HO_SO_MAC_DINH)
+            if delay_buoc < 0 or delay_hoso < 0:
+                raise ValueError()
+        except ValueError:
+            messagebox.showwarning("Sai định dạng", "Thời gian nghỉ (giây) phải là số >= 0.")
+            return
+
         if upload_hsq and (not folder or not os.path.isdir(folder)):
             messagebox.showwarning("Thiếu folder", "Đang bật đẩy hồ sơ quét — chọn folder hồ sơ quét hợp lệ.")
             return
@@ -756,6 +966,7 @@ class App:
         if not messagebox.askyesno(
             "Xác nhận",
             f"Chế độ: {che_do}\n"
+            f"Giãn nhịp: nghỉ {delay_buoc}s giữa các bước, {delay_hoso}s giữa 2 hồ sơ (±30% ngẫu nhiên).\n"
             f"Sẽ xử lý {len(df)} bản ghi (sau khi gộp trùng Số phát hành).\n"
             f"Thao tác DUYỆT VẬN HÀNH không dễ hoàn tác. Tiếp tục?",
         ):
@@ -763,15 +974,22 @@ class App:
 
         self.running = True
         self.stop_flag = False
+        self.resume_event.set()
         self.btn_run.configure(state="disabled")
+        self.btn_resume.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.progress.set(0)
 
-        threading.Thread(target=self._run_batch, args=(df, folder, excel, upload_hsq), daemon=True).start()
+        threading.Thread(
+            target=self._run_batch,
+            args=(df, folder, excel, upload_hsq, delay_buoc, delay_hoso),
+            daemon=True,
+        ).start()
 
-    def _run_batch(self, df, folder, excel_path, upload_hsq):
+    def _run_batch(self, df, folder, excel_path, upload_hsq, delay_buoc, delay_hoso):
         results = []
         total = len(df)
+        so_ok_lien_tiep = 0
 
         for i, row in df.iterrows():
             if self.stop_flag:
@@ -784,25 +1002,69 @@ class App:
 
             ket_qua = "OK"
             loi = ""
-            try:
-                self.client.xu_ly_1_ban_ghi(
-                    xa_id=row[COL_MA_XA],
-                    so_to=row[COL_SO_TO],
-                    so_thua=row[COL_SO_THUA],
-                    so_phat_hanh=sph,
-                    folder_pdf=folder,
-                    ds_ten_mo_ta=tach_danh_sach(row[COL_TEN_MO_TA]),
-                    ds_ten_file=tach_danh_sach(row[COL_TEN_FILE]),
-                    upload_hsq=upload_hsq,
-                )
-            except BoQuaBanGhi as e:
-                ket_qua = "BỎ QUA"
-                loi = str(e)
-                self.log(f"   → ⏭ Bỏ qua: {loi}")
-            except Exception as e:
-                ket_qua = "LỖI"
-                loi = str(e)
-                self.log(f"   → ❌ {loi}")
+            while True:
+                try:
+                    self.client.xu_ly_1_ban_ghi(
+                        xa_id=row[COL_MA_XA],
+                        so_to=row[COL_SO_TO],
+                        so_thua=row[COL_SO_THUA],
+                        so_phat_hanh=sph,
+                        folder_pdf=folder,
+                        ds_ten_mo_ta=tach_danh_sach(row[COL_TEN_MO_TA]),
+                        ds_ten_file=tach_danh_sach(row[COL_TEN_FILE]),
+                        upload_hsq=upload_hsq,
+                        delay_buoc=delay_buoc,
+                        sleep_fn=self._sleep_co_kiem_tra_dung,
+                    )
+                    ket_qua = "OK"
+                    loi = ""
+                    so_ok_lien_tiep += 1
+                    break
+                except BoQuaBanGhi as e:
+                    ket_qua = "BỎ QUA"
+                    loi = str(e)
+                    self.log(f"   → ⏭ Bỏ qua: {loi}")
+                    break
+                except LoiCaptchaHoacSession as e:
+                    if self.var_pause_captcha.get() and not self.stop_flag:
+                        self.log(f"   → 🛑 PHÁT HIỆN CAPTCHA / MẤT SESSION: {e}")
+                        self.log(
+                            "   👉 Hãy qua Chrome giải Captcha / F5 rồi bấm '2. Lấy session' "
+                            "(hoặc dán lại Cookie/Token mới rồi bấm 'Dùng Cookie/Token'), "
+                            "sau đó bấm nút '▶ Tiếp tục (sau Captcha)'!"
+                        )
+                        self.set_status(f"🛑 Đang tạm dừng tại {i + 1}/{total} ({sph}) vì Captcha/mất session...")
+                        self.resume_event.clear()
+                        self.root.after(0, lambda: self.btn_resume.configure(state="normal"))
+                        self.resume_event.wait()
+                        if self.stop_flag:
+                            ket_qua = "LỖI"
+                            loi = f"Đã dừng khi đang chờ xử lý Captcha: {e}"
+                            break
+                        continue
+                    else:
+                        ket_qua = "LỖI"
+                        loi = str(e)
+                        self.log(f"   → ❌ {loi}")
+                        break
+                except Exception as e:
+                    ket_qua = "LỖI"
+                    loi = str(e)
+                    self.log(f"   → ❌ {loi}")
+                    break
+
+            if self.stop_flag and ket_qua == "LỖI" and "Đã dừng khi đang chờ" in loi:
+                results.append({
+                    COL_MA_XA: row[COL_MA_XA],
+                    COL_SO_TO: row[COL_SO_TO],
+                    COL_SO_THUA: row[COL_SO_THUA],
+                    COL_SO_PHAT_HANH: sph,
+                    COL_TEN_MO_TA: row[COL_TEN_MO_TA],
+                    COL_TEN_FILE: row[COL_TEN_FILE],
+                    "Kết quả": ket_qua,
+                    "Lỗi": loi,
+                })
+                break
 
             results.append({
                 COL_MA_XA: row[COL_MA_XA],
@@ -816,6 +1078,18 @@ class App:
             })
 
             self.root.after(0, lambda v=(i + 1) / total: self.progress.set(v))
+
+            # Giãn nhịp giữa 2 hồ sơ (nếu chưa phải bản ghi cuối cùng)
+            if i + 1 < total and not self.stop_flag:
+                if ket_qua == "OK" and so_ok_lien_tiep > 0 and so_ok_lien_tiep % SO_HO_SO_NGHI_DAI == 0:
+                    nghi_dai = random.uniform(*THOI_GIAN_NGHI_DAI)
+                    self.log(f"   ☕ Đã duyệt {so_ok_lien_tiep} hồ sơ, nghỉ giải lao {nghi_dai:.1f}s để tránh Captcha...")
+                    self._sleep_co_kiem_tra_dung(nghi_dai)
+                elif delay_hoso > 0:
+                    # Nếu bản ghi bị BỎ QUA (chỉ tốn 1 request tra cứu) thì nghỉ ngắn hơn, nhưng tối thiểu 0.6s
+                    base_sleep = delay_hoso if ket_qua != "BỎ QUA" else max(0.6, delay_hoso * 0.4)
+                    thoi_gian_nghi = tinh_delay_jitter(base_sleep)
+                    self._sleep_co_kiem_tra_dung(thoi_gian_nghi)
 
         # Xuất kết quả
         try:
@@ -835,11 +1109,20 @@ class App:
         self.set_status(f"Hoàn tất: {ok} OK | {bo_qua} bỏ qua | {loi} lỗi / {len(results)}")
 
         self.running = False
-        self.root.after(0, lambda: (self.btn_run.configure(state="normal"), self.btn_stop.configure(state="disabled")))
+        self.root.after(
+            0,
+            lambda: (
+                self.btn_run.configure(state="normal"),
+                self.btn_resume.configure(state="disabled"),
+                self.btn_stop.configure(state="disabled"),
+            ),
+        )
 
     def on_close(self):
         if self.running and not messagebox.askyesno("Đang chạy", "Đang xử lý, thoát luôn?"):
             return
+        self.stop_flag = True
+        self.resume_event.set()
         self.client.close_browser()
         self.root.destroy()
 
